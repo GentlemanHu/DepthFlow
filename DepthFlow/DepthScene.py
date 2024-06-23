@@ -1,69 +1,98 @@
+from __future__ import annotations
+
+import functools
 import math
-from typing import Annotated, Iterable, Tuple
+from abc import ABC, abstractmethod
+from typing import Annotated, Any, Iterable, Tuple
 
 import imgui
+import typer
 from attr import define, field
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from ShaderFlow.Message import ShaderMessage
-from ShaderFlow.Modules.Depth import (
+from ShaderFlow.Scene import ShaderScene
+from ShaderFlow.Texture import ShaderTexture
+from ShaderFlow.Variable import ShaderVariable
+from typer import Option
+
+from Broken import pydantic_cli
+from Broken.Externals.Depthmap import (
     DepthAnything,
     DepthAnythingV2,
     DepthEstimator,
     Marigold,
     ZoeDepth,
 )
-from ShaderFlow.Scene import ShaderScene
-from ShaderFlow.Texture import ShaderTexture
-from ShaderFlow.Variable import ShaderVariable
-from typer import Option
-
-from Broken import image_hash
-from Broken.Externals.Upscaler import BrokenUpscaler, Realesr
+from Broken.Externals.Upscaler import BrokenUpscaler, NoUpscaler, Realesr, Waifu2x
 from Broken.Loaders import LoaderImage
 from DepthFlow import DEPTHFLOW
 
+DEPTHFLOW_ABOUT = """
+🌊 Image to → 2.5D Parallax Effect Video. High quality, user first.\n
+
+Usage: Chain commands, at minimum just [green]main[/green] for a realtime window, drag and drop images
+• The --main command is used for exporting videos, setting quality, resolution
+• All commands have a --help option with extensible configuration
+
+Examples:
+• Upscaler:    (depthflow realesr --scale 2 input -i ~/image.png main -o ./output.mp4 --ssaa 1.5)
+• Convenience: (depthflow input -i ~/image16x9.png main -h 1440) [bright_black]# Auto calculates w=2560[/bright_black]
+• Estimator:   (depthflow anything2 --model large input -i ~/image.png main)
+• Post FX:     (depthflow dof -e vignette -e main)
+
+Notes:
+• The rendered video loops perfectly, the duration is the main's --time
+• The last two commands must be --input and --main in order to work
+"""
 
 class DepthFlowState(BaseModel):
+    """Set parallax parameter values on the state [green](See 'config --help' for options)[/green]"""
 
-    height: float = Field(default=0.35)
-    """Peak value of the Depth Map, in the range [0, 1]. The camera is 1 distance away from depth=0
-    at the z=1 plane, so this also controls the intensity of the effect"""
+    height: Annotated[float, typer.Option("--height", "-h", min=0, max=1,
+        help="[bold][red](🔴 Basic   )[/red][/bold] Depthmap's peak value, the effect [bold][cyan]intensity[/cyan][/bold] [medium_purple3](The camera is 1 distance away from depth=0 at the z=1 plane)[/medium_purple3]")] = \
+        Field(default=0.35)
 
-    static: float = Field(default=0.25)
-    """Focal depth of offsets, in the range [0, 1]. A value of 0 makes the background (depth=0)
-    stationary, while a value of 1 makes the foreground (depth=1) stationary on offset changes"""
+    static: Annotated[float, typer.Option("--static", "-s", min=0, max=1,
+        help="[bold][red](🔴 Basic   )[/red][/bold] Focal depth plane of [bold][cyan]offsets[/cyan][/bold] [medium_purple3](A value of 0 makes the background stationary; and 1 for the foreground)[/medium_purple3]")] = \
+        Field(default=0.25)
 
-    focus: float = Field(default=0.5)
-    """Focal depth of projections, in the range [0, 1]. A value of 0 makes the background (depth=0)
-    stationaty, while a value of 1 makes the foreground (depth=1) stationary on isometric changes"""
+    focus: Annotated[float, typer.Option("--focus", "-f", min=0, max=1,
+        help="[bold][red](🔴 Basic   )[/red][/bold] Focal depth plane of [bold][cyan]perspective[/cyan][/bold] [medium_purple3](A value of 0 makes the background stationary; and 1 for the foreground)[/medium_purple3]")] = \
+        Field(default=0.5)
 
-    invert: float = Field(default=0.0)
-    """Interpolate between (0=max, 1=min)=0 or (0=min, 1=max)=1 Depth Map's value interpretation"""
+    zoom: Annotated[float, typer.Option("--zoom", "-z", min=0,
+        help="[bold][red](🔴 Basic   )[/red][/bold] Camera [bold][cyan]zoom factor[/cyan][/bold] [medium_purple3](2 means a quarter of the image is visible)[/medium_purple3]")] = \
+        Field(default=1.0)
 
-    zoom: float = Field(default=1.0)
-    """Camera zoom factor, in the range [0, inf]. 2 means a quarter of the image is visible"""
+    isometric: Annotated[float, typer.Option("--isometric", "-iso", min=0, max=1,
+        help="[bold][yellow](🟡 Medium  )[/yellow][/bold] Isometric factor of [bold][cyan]camera projections[/cyan][/bold] [medium_purple3](Zero is fully perspective, 1 is orthographic)[/medium_purple3]")] = \
+        Field(default=0.0)
 
-    isometric: float = Field(default=0.0)
-    """Isometric factor of the camera projection. Zero is fully perspective, 1 is orthographic"""
+    dolly: Annotated[float, typer.Option("--dolly", "-d", min=0, max=1,
+        help="[bold][yellow](🟡 Medium  )[/yellow][/bold] Same effect as --isometric, dolly zoom [medium_purple3](Move back ray projection origins by this amount)[/medium_purple3]")] = \
+        Field(default=0.0)
 
-    dolly: float = Field(default=0.0)
-    """Same effect as isometric, but with "natural units" of AFAIK `isometric = atan(dolly)*(2/pi)`.
-    Keeps the ray target constant and move back ray origins by this amount"""
+    invert: Annotated[float, typer.Option("--invert", "-inv", min=0, max=1,
+        help="[bold][yellow](🟡 Medium  )[/yellow][/bold] Interpolate depth values between (0=far, 1=near) and vice-versa, as in [bold][cyan]mix(height, 1-height, invert)[/bold][/cyan]")] = \
+        Field(default=0.0)
 
-    mirror: bool = Field(default=True)
-    """Apply GL_MIRRORED_REPEAT to the image, makes it continuous"""
+    mirror: Annotated[bool, typer.Option("--mirror", "-m", " /-n",
+        help="[bold][yellow](🟡 Medium  )[/yellow][/bold] Apply [bold][cyan]GL_MIRRORED_REPEAT[/cyan][/bold] to the image [medium_purple3](The image is mirrored out of bounds on the respective edge)[/medium_purple3]")] = \
+        Field(default=True)
 
     # # Center
 
-    center_x: float = Field(default=0)
-    """Horizontal 'true' offset of the camera, the camea *is* above this point"""
+    center_x: Annotated[float, typer.Option("--center-x", "-cex", min=0, max=1,
+        help="[green](🟢 Advanced)[/green] Horizontal 'true' offset of the camera [medium_purple3](The camera *is* above this point)[/medium_purple3]")] = \
+        Field(default=0)
 
-    center_y: float = Field(default=0)
-    """Vertical 'true' offset of the camera, the camea *is* above this point"""
+    center_y: Annotated[float, typer.Option("--center-y", "-cey", min=0, max=1,
+        help="[green](🟢 Advanced)[/green] Vertical   'true' offset of the camera [medium_purple3](The camera *is* above this point)[/medium_purple3]")] = \
+        Field(default=0)
 
     @property
     def center(self) -> Tuple[float, float]:
-        """'True' offset of the camera, the camea *is* above this point"""
+        """'True' offset of the camera, the camera *is* above this point"""
         return (self.center_x, self.center_y)
 
     @center.setter
@@ -75,8 +104,13 @@ class DepthFlowState(BaseModel):
     origin_x: float = Field(default=0)
     """Hozirontal focal point of the offsets, *as if* the camera was above this point"""
 
-    origin_y: float = Field(default=0)
-    """Vertical focal point of the offsets, *as if* the camera was above this point"""
+    origin_x: Annotated[float, typer.Option("--origin-x", "-orx", min=0, max=1,
+        help="[green](🟢 Advanced)[/green] Horizontal focal point of the offsets [medium_purple3](*As if* the camera was above this point)[/medium_purple3]")] = \
+        Field(default=0)
+
+    origin_y: Annotated[float, typer.Option("--origin-y", "-ory", min=0, max=1,
+        help="[green](🟢 Advanced)[/green] Vertical   focal point of the offsets [medium_purple3](*As if* the camera was above this point)[/medium_purple3]")] = \
+        Field(default=0)
 
     @property
     def origin(self) -> Tuple[float, float]:
@@ -89,11 +123,13 @@ class DepthFlowState(BaseModel):
 
     # # Parallax
 
-    offset_x: float = Field(default=0)
-    """Parallax horizontal displacement, change this over time for the 3D effect"""
+    offset_x: Annotated[float, typer.Option("--offset-x", "-ofx", min=0, max=1,
+        help="[green](🟢 Advanced)[/green] Horizontal parallax displacement [medium_purple3](Change this over time for the 3D effect)[/medium_purple3]")] = \
+        Field(default=0)
 
-    offset_y: float = Field(default=0)
-    """Parallax vertical displacement, change this over time for the 3D effect"""
+    offset_y: Annotated[float, typer.Option("--offset-y", "-ofy", min=0, max=1,
+        help="[green](🟢 Advanced)[/green] Vertical   parallax displacement [medium_purple3](Change this over time for the 3D effect)[/medium_purple3]")] = \
+        Field(default=0)
 
     @property
     def offset(self) -> Tuple[float, float]:
@@ -111,13 +147,34 @@ class DepthFlowState(BaseModel):
             setattr(self, name, field.default)
 
     class _PFX_DOF(BaseModel):
-        enable:     bool  = Field(default=False)
-        start:      float = Field(default=0.6)
-        end:        float = Field(default=1.0)
-        exponent:   float = Field(default=2.0)
-        intensity:  float = Field(default=1)
-        quality:    int   = Field(default=4)
-        directions: int   = Field(default=16)
+        """Set depth of field parameters [green](See 'dof --help' for options)[/green]"""
+        enable: Annotated[bool, typer.Option("--enable", "-e",
+            help="[bold][blue](🔵 Special )[/blue][/bold] Enable the Depth of field effect")] = \
+            Field(default=False)
+
+        start: Annotated[float, typer.Option("--start", "-a",
+            help="[green](🟢 Advanced)[/green] Effect starts at this depth distance")] = \
+            Field(default=0.6)
+
+        end: Annotated[float, typer.Option("--end", "-b",
+            help="[green](🟢 Advanced)[/green] Effect ends at this depth distance")] = \
+            Field(default=1.0)
+
+        exponent: Annotated[float, typer.Option("--exponent", "-t", min=0, max=10,
+            help="[green](🟢 Advanced)[/green] Effect depth exponent")] = \
+            Field(default=2.0)
+
+        intensity: Annotated[float, typer.Option("--intensity", "-i", min=0, max=2,
+            help="[green](🟢 Advanced)[/green] Effect blur intensity")] = \
+            Field(default=1.0)
+
+        quality: Annotated[int, typer.Option("--quality", "-q", min=1, max=16,
+            help="[green](🟢 Advanced)[/green] Effect blur quality (radial steps)")] = \
+            Field(default=4)
+
+        directions: Annotated[int, typer.Option("--directions", "-d",
+            help="[green](🟢 Advanced)[/green] Effect blur quality (directions)")] = \
+            Field(default=16)
 
         def pipeline(self) -> Iterable[ShaderVariable]:
             yield ShaderVariable("uniform", "bool",  "iDofEnable",     self.enable)
@@ -128,20 +185,29 @@ class DepthFlowState(BaseModel):
             yield ShaderVariable("uniform", "int",   "iDofQuality",    self.quality)
             yield ShaderVariable("uniform", "int",   "iDofDirections", self.directions)
 
-    dof: _PFX_DOF = Field(default_factory=_PFX_DOF)
+    _dof: _PFX_DOF = PrivateAttr(default_factory=_PFX_DOF)
     """Depth of Field Post-Processing configuration"""
 
     class _PFX_Vignette(BaseModel):
-        enable:    bool  = Field(default=False)
-        intensity: float = Field(default=30)
-        decay:     float = Field(default=0.1)
+        """Set vignette parameters [green](See 'vignette --help' for options)[/green]"""
+        enable: Annotated[bool, typer.Option("--enable", "-e",
+            help="[bold][blue](🔵 Special )[/blue][/bold] Enable the Vignette effect")] = \
+            Field(default=False)
+
+        intensity: Annotated[float, typer.Option("--intensity", "-i", min=0, max=100,
+            help="[green](🟢 Advanced)[/green] Intensity of the Vignette effect")] = \
+            Field(default=30)
+
+        decay: Annotated[float, typer.Option("--decay", "-d", min=0, max=1,
+            help="[green](🟢 Advanced)[/green] Decay of the Vignette effect")] = \
+            Field(default=0.1)
 
         def pipeline(self) -> Iterable[ShaderVariable]:
             yield ShaderVariable("uniform", "bool",  "iVignetteEnable",    self.enable)
             yield ShaderVariable("uniform", "float", "iVignetteIntensity", self.intensity)
             yield ShaderVariable("uniform", "float", "iVignetteDecay",     self.decay)
 
-    vignette: _PFX_Vignette = Field(default_factory=_PFX_Vignette)
+    _vignette: _PFX_Vignette = PrivateAttr(default_factory=_PFX_Vignette)
     """Vignette Post-Processing configuration"""
 
     def pipeline(self) -> Iterable[ShaderVariable]:
@@ -156,14 +222,21 @@ class DepthFlowState(BaseModel):
         yield ShaderVariable("uniform", "vec2",  "iDepthOrigin",    self.origin)
         yield ShaderVariable("uniform", "vec2",  "iDepthOffset",    self.offset)
         yield ShaderVariable("uniform", "bool",  "iDepthMirror",    self.mirror)
-        yield from self.dof.pipeline()
-        yield from self.vignette.pipeline()
+        yield from self._dof.pipeline()
+        yield from self._vignette.pipeline()
+
+# -------------------------------------------------------------------------------------------------|
+
+class DepthFlowAnimation(BaseModel, ABC):
+
+    @abstractmethod
+    def update(self, scene: DepthFlowScene) -> None:
+        pass
 
 # -------------------------------------------------------------------------------------------------|
 
 @define
 class DepthFlowScene(ShaderScene):
-    """🌊 Image to → 2.5D Parallax Effect Video. High quality, user first"""
     __name__ = "DepthFlow"
 
     # Constants
@@ -172,29 +245,50 @@ class DepthFlowScene(ShaderScene):
 
     # DepthFlow objects
     estimator: DepthEstimator = field(factory=DepthAnything)
-    upscaler: BrokenUpscaler = field(factory=Realesr)
+    upscaler: BrokenUpscaler = field(factory=NoUpscaler)
     state: DepthFlowState = field(factory=DepthFlowState)
 
     def input(self,
-        image: Annotated[str, Option("--image", "-i", help="[bold][red](🔴 Basic)[/red][/bold] Background Image [green](Path, URL, NumPy, PIL)[/green]")],
-        depth: Annotated[str, Option("--depth", "-d", help="[bold][red](🔴 Basic)[/red][/bold] Depthmap of the Image [medium_purple3](None to estimate)[/medium_purple3]")]=None,
+        image: Annotated[str, Option("--image", "-i", help="Background Image [green](Path, URL, NumPy, PIL)[/green]")],
+        depth: Annotated[str, Option("--depth", "-d", help="Depthmap of the Image [medium_purple3](None to estimate)[/medium_purple3]")]=None,
     ) -> None:
-        """Load an Image from Path, URL and its estimated DepthMap to the Scene, and optionally upscale it. See 'input --help'"""
+        """Load an Image from Path, URL and its estimated Depthmap [green](See 'input --help' for options)[/green]"""
         image = self.upscaler.upscale(LoaderImage(image))
         depth = LoaderImage(depth) or self.estimator.estimate(image)
         self.aspect_ratio = (image.width/image.height)
         self.image.from_image(image)
         self.depth.from_image(depth)
-        self.time = 0
+
+    def set_upscaler(self, upscaler: BrokenUpscaler) -> None:
+        self.upscaler = upscaler
+
+    def set_estimator(self, estimator: DepthEstimator) -> None:
+        self.estimator = estimator
 
     def commands(self):
+        self.typer.description = DEPTHFLOW_ABOUT
         self.typer.command(self.input)
-        self.typer.command(self.upscaler, panel="Upscaler")
-        self.upscaler.scale = 1
+        self.typer.command(self.state, name="config", requires=True)
+
+        with self.typer.panel("🌊 Depth estimators"):
+            self.typer.command(pydantic_cli(DepthAnything(), post=self.set_estimator), name="anything1")
+            self.typer.command(pydantic_cli(DepthAnythingV2(), post=self.set_estimator), name="anything2")
+            self.typer.command(pydantic_cli(ZoeDepth(), post=self.set_estimator), name="zoedepth")
+            self.typer.command(pydantic_cli(Marigold(), post=self.set_estimator), name="marigold")
+
+        with self.typer.panel("⭐️ Upscalers"):
+            self.typer.command(pydantic_cli(Realesr(), post=self.set_upscaler), name="realesr", requires=True)
+            self.typer.command(pydantic_cli(Waifu2x(), post=self.set_upscaler), name="waifu2x", requires=True)
+
+        with self.typer.panel("✨ Post processing"):
+            self.typer.command(self.state._vignette, name="vignette", requires=True)
+            self.typer.command(self.state._dof, name="dof", requires=True)
 
     def setup(self):
         if self.image.is_empty():
             self.input(image=DepthFlowScene.DEFAULT_IMAGE)
+        self.ssaa = 1.2
+        self.time = 0
 
     def build(self):
         ShaderScene.build(self)
