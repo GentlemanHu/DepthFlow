@@ -48,8 +48,8 @@ class DepthEstimator(ABC):
     ) -> np.ndarray[np.float32]:
         import zlib
 
-        image = imageio.imread(image)
-        # image = image.convert("RGB")
+        if not isinstance(image, np.ndarray):
+            image = imageio.imread(image)
 
         # Uniquely identify the image and current parameters
         key: int = xxhash.xxh3_64_intdigest(
