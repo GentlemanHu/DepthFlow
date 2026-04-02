@@ -1091,8 +1091,14 @@ class CudaDepthFlowRenderer:
         codec: str = "h264_nvenc",
         output_format: str = "mp4",
         progress_cb: Optional[Callable[[int, int], None]] = None,
+        capture_frames: int = 0,
     ) -> str:
-        """Render a full parallax video to *output_path*."""
+        """Render a full parallax video to *output_path*.
+
+        If *capture_frames* > 0, also collect up to that many frames as
+        tensors and store them in ``self.captured_frames`` (list of HWC uint8
+        CPU tensors).  Set to -1 to capture all frames.
+        """
 
         # SSAA: render at higher resolution, then downscale
         ssaa_w = int(render_w * ssaa)
@@ -1137,6 +1143,11 @@ class CudaDepthFlowRenderer:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         t0 = time.perf_counter()
 
+        # Optional frame capture (avoids re-decoding the video later)
+        do_capture = capture_frames != 0
+        max_cap = total_frames if capture_frames < 0 else capture_frames
+        self.captured_frames: list = []
+
         try:
             for frame_idx in range(total_frames):
                 tau = frame_idx / max(total_frames - 1, 1)
@@ -1148,6 +1159,10 @@ class CudaDepthFlowRenderer:
                 )
                 frame = self.render_frame(ssaa_w, ssaa_h, state, quality_pct)
                 proc.stdin.write(frame.numpy().tobytes())
+
+                # Capture frame directly (already CPU uint8 HWC)
+                if do_capture and len(self.captured_frames) < max_cap:
+                    self.captured_frames.append(frame)
 
                 if progress_cb:
                     progress_cb(frame_idx + 1, total_frames)
