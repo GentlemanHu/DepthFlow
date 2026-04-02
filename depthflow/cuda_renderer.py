@@ -121,27 +121,32 @@ __global__ void forward_march_k(
     hit_out[idx] = 0;
 }
 
-/* ── binary search ───────────────────────────────────────────────────── */
+/* ── backward linear refinement (matches GLSL Stage 1) ───────────────── */
 
-__global__ void bisect_k(
+__global__ void backward_refine_k(
     const float* __restrict__ depth,
     const float* __restrict__ ox, const float* __restrict__ oy,
     const float* __restrict__ ix, const float* __restrict__ iy,
-    float* __restrict__ wlo, float* __restrict__ whi,
+    const float* __restrict__ walk_in, const int* __restrict__ hit_in,
+    float* __restrict__ walk_out,
     float oz, int npx, int iw, int ih,
     float dh, float di, bool mirror, float wa,
-    float safe, float sx, int steps
+    float safe, float sx, float quality_step
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= npx) return;
+    if (!hit_in[idx]) { walk_out[idx] = walk_in[idx]; return; }
 
     float o_x = __ldg(&ox[idx]), o_y = __ldg(&oy[idx]);
     float i_x = __ldg(&ix[idx]), i_y = __ldg(&iy[idx]);
-    float lo = wlo[idx], hi = whi[idx];
+    float w = walk_in[idx];
 
-    for (int s = 0; s < steps; s++) {
-        float mid = (lo + hi) * 0.5f;
-        float mt = safe + (1.0f - safe) * mid;
+    // Walk backwards with tiny steps until we exit the surface
+    for (int s = 0; s < 2000; s++) {
+        w -= quality_step;
+        if (w < 0.0f) { w = 0.0f; break; }
+
+        float mt = safe + (1.0f - safe) * w;
         float c1 = 1.0f - mt;
         float ceil_v = 1.0f - (oz * c1 + mt);
 
@@ -151,10 +156,10 @@ __global__ void bisect_k(
         float dv = bilerp(depth, iw, ih, gx, gy);
         float surf = dh * (dv * (1.0f - di) + (1.0f - dv) * di);
 
-        if (surf > ceil_v) hi = mid; else lo = mid;
+        // Outside the surface — this is our answer
+        if (surf <= ceil_v) break;
     }
-    wlo[idx] = lo;
-    whi[idx] = hi;
+    walk_out[idx] = w;
 }
 
 /* ── walk → gluv recovery ────────────────────────────────────────────── */
@@ -205,23 +210,24 @@ std::vector<torch::Tensor> native_forward_march(
 std::vector<torch::Tensor> native_bisect(
     torch::Tensor depth, torch::Tensor orig_x, torch::Tensor orig_y,
     torch::Tensor int_x, torch::Tensor int_y,
-    torch::Tensor walk_hi, torch::Tensor walk_lo,
+    torch::Tensor walk_in, torch::Tensor hit_in,
     double oz, int iw, int ih,
     double dh, double di, bool mirror, double wa,
-    double safe, double sx, int steps
+    double safe, double sx, double quality_step
 ) {
     int npx = orig_x.numel();
-    auto wlo = walk_lo.clone(), whi = walk_hi.clone();
+    auto wout = walk_in.clone();
     int t = 256, b = (npx + t - 1) / t;
-    bisect_k<<<b, t>>>(
+    backward_refine_k<<<b, t>>>(
         depth.data_ptr<float>(),
         orig_x.data_ptr<float>(), orig_y.data_ptr<float>(),
         int_x.data_ptr<float>(), int_y.data_ptr<float>(),
-        wlo.data_ptr<float>(), whi.data_ptr<float>(),
+        walk_in.data_ptr<float>(), hit_in.data_ptr<int>(),
+        wout.data_ptr<float>(),
         (float)oz, npx, iw, ih,
         (float)dh, (float)di, mirror, (float)wa,
-        (float)safe, (float)sx, steps);
-    return {wlo, whi};
+        (float)safe, (float)sx, (float)quality_step);
+    return {wout};
 }
 
 torch::Tensor native_walk2gluv(
@@ -259,7 +265,7 @@ std::vector<torch::Tensor> native_bisect(
     torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor,
     double, int, int, double, double, bool, double,
-    double, double, int);
+    double, double, double);
 torch::Tensor native_walk2gluv(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, double);
@@ -280,7 +286,7 @@ def _get_native_module():
         os.environ["PATH"] = ninja.BIN_DIR + os.pathsep + os.environ.get("PATH", "")
         from torch.utils.cpp_extension import load_inline
         _NATIVE_MODULE = load_inline(
-            name="depthflow_native",
+            name="depthflow_native_v2",
             cpp_sources=_CPP_SRC,
             cuda_sources=_CUDA_SRC,
             functions=[
@@ -475,10 +481,20 @@ def compute_animation_state(
         else:
             p = -0.75 if reverse else 0.25
             c = 0.5
+
+        # Original Dolly passes reverse=(not self.reverse) to its inner Sine
+        dolly_reverse = not reverse
+        if dolly_reverse:
+            inner_cycle = 2.0 * math.pi - cycle
+            inner_tau = 1.0 - tau
+        else:
+            inner_cycle = cycle
+            inner_tau = tau
+
         val = (_compute_sine if smooth else _compute_triangle)(
-            tau, cycle, intensity / 2.0, phase + p, cycles=c, bias=intensity / 2.0,
+            inner_tau, inner_cycle, intensity / 2.0, phase + p, cycles=c, bias=intensity / 2.0,
         ) if smooth else _compute_triangle(
-            tau, intensity / 2.0, phase + p, cycles=c, bias=intensity / 2.0,
+            inner_tau, intensity / 2.0, phase + p, cycles=c, bias=intensity / 2.0,
         )
         state.isometric = val
 
@@ -681,20 +697,16 @@ class CudaDepthFlowRenderer:
                 probe_step, safe, scale_x,
             )
 
-            # Binary search refinement
-            walk_hi = walk.clone()
-            walk_lo = (walk - probe_step).clamp(min=0.0)
-            has_hit = hit.bool()
-            walk_hi = torch.where(has_hit, walk_hi, torch.ones_like(walk_hi))
-            walk_lo = torch.where(has_hit, walk_lo, torch.ones_like(walk_lo))
-
-            wlo, _whi = native.native_bisect(
+            # Backward linear refinement (matches GLSL Stage 1)
+            quality_step = 1.0 / (200.0 + 1800.0 * quality_norm)
+            wout_list = native.native_bisect(
                 depth_flat, ox, oy, ix, iy,
-                walk_hi, walk_lo,
+                walk, hit,
                 orig_z_val, self.img_w, self.img_h,
                 df_height, df_invert, mirror, want_aspect,
-                safe, scale_x, 10,
+                safe, scale_x, quality_step,
             )
+            wlo = wout_list[0]
 
             # Recover gluv from walk values
             gluv_stack = native.native_walk2gluv(
@@ -771,17 +783,17 @@ class CudaDepthFlowRenderer:
             walk_at_hit = torch.where(newly_hit, walk_f, walk_at_hit)
             has_hit = has_hit | newly_hit
 
-        # --- Binary-search backward (16 steps for fine refinement) --------
-        walk_hi = torch.where(has_hit, walk_at_hit, torch.ones_like(walk_at_hit))
-        walk_lo = torch.where(
-            has_hit,
-            (walk_at_hit - coarse_probe).clamp(min=0.0),
-            torch.ones_like(walk_at_hit),
-        )
+        # --- Backward linear refinement (matches GLSL Stage 1) -----------
+        quality_step = 1.0 / (200.0 + 1800.0 * quality_norm)
+        n_backward = int(coarse_probe / quality_step) + 10
 
-        for _ in range(16):
-            walk_mid = (walk_lo + walk_hi) * 0.5
-            mix_t = safe + (1.0 - safe) * walk_mid            # (H, W)
+        # For no-hit pixels, walk stays at 1.0 (→ intersect)
+        walk_result = torch.where(has_hit, walk_at_hit, torch.ones_like(walk_at_hit))
+        refining = has_hit.clone()
+
+        for _ in range(n_backward):
+            walk_cand = (walk_result - quality_step).clamp(min=0.0)
+            mix_t = safe + (1.0 - safe) * walk_cand
             ceiling = 1.0 - (orig_z_val * (1.0 - mix_t) + int_z_val * mix_t)
 
             pt_x = orig_x + dir_x * mix_t
@@ -804,12 +816,18 @@ class CudaDepthFlowRenderer:
             surface = df_height * (
                 d_val * (1.0 - df_invert) + (1.0 - d_val) * df_invert
             )
-            inside = surface > ceiling
-            walk_hi = torch.where(inside, walk_mid, walk_hi)
-            walk_lo = torch.where(~inside, walk_mid, walk_lo)
+            # Still inside → keep walking backward
+            still_inside = refining & (surface > ceiling)
+            walk_result = torch.where(still_inside, walk_cand, walk_result)
+            # Exited → stop refining this pixel
+            refining = still_inside
 
-        # Final result at walk_lo (just outside the surface ─ matches GLSL)
-        # For no-hit pixels walk_lo=1.0 → mix_t=1.0 → point = intersect
+            if not refining.any():
+                break
+
+        walk_lo = walk_result
+
+        # Final result — matches GLSL: no-hit pixels have walk_lo=1.0 → intersect
         mix_t = safe + (1.0 - safe) * walk_lo
         result_gluv_x = orig_x + dir_x * mix_t
         result_gluv_y = orig_y + dir_y * mix_t
