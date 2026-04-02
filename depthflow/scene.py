@@ -102,13 +102,21 @@ class DepthScene(ShaderScene):
             if (depth is not None) else \
             self.estimator.estimate(image)
 
-        self.image.from_numpy(image)
-        self.depth.from_numpy(depth)
-
-        # Keep raw numpy copies for CUDA backend
+        # Keep raw numpy copies for CUDA backend / deferred loading
         self._raw_image = image
         self._raw_depth = depth
 
+        # Load into textures if build() has already created them
+        self._load_inputs()
+
+    def _load_inputs(self) -> None:
+        """Load cached numpy data into ShaderTextures (only if build() ran)."""
+        if not hasattr(self, '_raw_image') or self._raw_image is None:
+            return
+        if not hasattr(self, 'image') or self.image is None:
+            return
+        self.image.from_numpy(self._raw_image)
+        self.depth.from_numpy(self._raw_depth)
         # Match rendering resolution to image
         self.resolution = self.image.size
 
@@ -210,6 +218,8 @@ class DepthScene(ShaderScene):
         self.runtime = 5.0
 
     def setup(self) -> None:
+        # Load deferred input data into textures (now that build() created them)
+        self._load_inputs()
         if (not self.animation.steps):
             self.animation.add(Animation.Orbital())
         if self.image.is_empty():
@@ -223,7 +233,6 @@ class DepthScene(ShaderScene):
 
         if isinstance(message, ShaderMessage.Window.FileDrop):
             self.input(image=message.first, depth=message.second)
-            self._load_inputs()
 
     def pipeline(self) -> Iterable[ShaderVariable]:
         yield from ShaderScene.pipeline(self)
