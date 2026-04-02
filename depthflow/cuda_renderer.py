@@ -735,8 +735,8 @@ class CudaDepthFlowRenderer:
         pt_x = torch.empty(render_h, render_w, device=dev)
         pt_y = torch.empty(render_h, render_w, device=dev)
 
-        # --- Forward pass — exact GLSL probe step, ZERO CPU↔GPU syncs ----
-        coarse_probe = probe_step
+        # --- Forward pass — 2× probe (binary search gives sub-pixel precision) --
+        coarse_probe = probe_step * 2.0
         n_forward = int(1.0 / coarse_probe) + 2
         for i in range(n_forward):
             walk_f = coarse_probe * (i + 1)                 # Python float
