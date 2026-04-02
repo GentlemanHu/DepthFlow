@@ -1,7 +1,7 @@
 import contextlib
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Optional
 
 import imageio.v3 as imageio
 import pooch
@@ -85,10 +85,10 @@ class DepthScene(ShaderScene):
                     self.cli.command(post, group=group, result_action=self.animation.add)
 
     def input(self,
-        image: Annotated[str, Parameter(
+        image: Annotated[Optional[str], Parameter(
             help="Input image from Path, NumPy, URL (None to default)",
             name=("--image", "-i"))] = None,
-        depth: Annotated[str, Parameter(
+        depth: Annotated[Optional[str], Parameter(
             help="Input depthmap of the image (None to estimate)",
             name=("--depth", "-d"))] = None,
     ) -> None:
