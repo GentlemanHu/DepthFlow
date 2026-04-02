@@ -1,17 +1,20 @@
 # pyright: reportMissingImports=false
 import copy
+import logging
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pooch
 from PIL import Image
 from pydantic import PrivateAttr
 from shaderflow.resolution import Resolution
 
-from broken import logger
-from broken.path import BrokenPath
 from depthflow.estimators import DepthEstimator
+
+logger = logging.getLogger(__name__)
 
 
 class DepthPro(DepthEstimator):
@@ -29,7 +32,14 @@ class DepthPro(DepthEstimator):
 
         # Download external checkpoint model
         logger.info("Loading Depth Estimator model (DepthPro)")
-        checkpoint = BrokenPath.get_external("https://ml-site.cdn-apple.com/models/depth-pro/depth_pro.pt")
+        import depthflow
+        checkpoint = pooch.retrieve(
+            url="https://ml-site.cdn-apple.com/models/depth-pro/depth_pro.pt",
+            known_hash=None,
+            path=depthflow.directories.user_data_path,
+            fname="depth_pro.pt",
+            progressbar=True,
+        )
 
         import torch
         from depth_pro import create_model_and_transforms

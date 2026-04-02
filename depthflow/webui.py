@@ -16,8 +16,16 @@ from shaderflow.resolution import Resolution
 from typer import Option
 
 import depthflow
-from broken.utils import DictUtils
 from depthflow.animation import Animation, FilterBase, PresetBase
+
+
+def _rvalues(obj):
+    """Recursively extract all leaf values from nested dicts/DotMaps."""
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _rvalues(v)
+    else:
+        yield obj
 from depthflow.estimators import DepthEstimator
 from depthflow.estimators.anything import (
     DepthAnythingV2,
@@ -141,8 +149,8 @@ class DepthGradio:
     def simple(self, method: Callable, **options: dict) -> dict:
         """An ugly hack to avoid manually listing inputs and outputs"""
         show_progress = bool(options.get("outputs"))
-        outputs = options.pop("outputs", set(DictUtils.rvalues(self.ui)))
-        inputs  = options.pop("inputs",  set(DictUtils.rvalues(self.ui)))
+        outputs = options.pop("outputs", set(_rvalues(self.ui)))
+        inputs  = options.pop("inputs",  set(_rvalues(self.ui)))
         return dict(
             fn=method,
             inputs=inputs,
