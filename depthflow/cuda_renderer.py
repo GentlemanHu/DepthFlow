@@ -169,15 +169,12 @@ __global__ void walk2gluv_k(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= npx) return;
-    if (hit[idx]) {
-        float mt = safe + (1.0f - safe) * walk[idx];
-        float c1 = 1.0f - mt;
-        rgx[idx] = ox[idx] * c1 + ix[idx] * mt;
-        rgy[idx] = oy[idx] * c1 + iy[idx] * mt;
-    } else {
-        rgx[idx] = cgx[idx];
-        rgy[idx] = cgy[idx];
-    }
+    // For hit pixels, walk is the refined boundary; for no-hit, walk=1.0
+    // which gives mix_t=1.0 → point = intersect (correct GLSL behavior)
+    float mt = safe + (1.0f - safe) * walk[idx];
+    float c1 = 1.0f - mt;
+    rgx[idx] = ox[idx] * c1 + ix[idx] * mt;
+    rgy[idx] = oy[idx] * c1 + iy[idx] * mt;
 }
 
 /* ── Python bindings ──────────────────────────────────────────────────── */
@@ -812,13 +809,10 @@ class CudaDepthFlowRenderer:
             walk_lo = torch.where(~inside, walk_mid, walk_lo)
 
         # Final result at walk_lo (just outside the surface ─ matches GLSL)
+        # For no-hit pixels walk_lo=1.0 → mix_t=1.0 → point = intersect
         mix_t = safe + (1.0 - safe) * walk_lo
-        result_gluv_x = torch.where(
-            has_hit, orig_x + dir_x * mix_t, cam_gluv_x,
-        )
-        result_gluv_y = torch.where(
-            has_hit, orig_y + dir_y * mix_t, cam_gluv_y,
-        )
+        result_gluv_x = orig_x + dir_x * mix_t
+        result_gluv_y = orig_y + dir_y * mix_t
 
         # Depth at result for blur post-processing → (1, 1, H, W)
         if mirror:
