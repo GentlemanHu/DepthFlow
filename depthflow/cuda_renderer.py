@@ -500,6 +500,67 @@ def compute_animation_state(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# GLSL-matching helpers (HSV, smoothstep)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _rgb_to_hsv(r: "torch.Tensor", g: "torch.Tensor", b: "torch.Tensor"
+                ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    """Vectorised RGB→HSV matching ``rgb2hsv`` in shaderflow.glsl."""
+    cmax = torch.max(torch.max(r, g), b)
+    cmin = torch.min(torch.min(r, g), b)
+    delta = cmax - cmin
+
+    # Hue
+    h = torch.zeros_like(r)
+    nonzero = delta > 1e-8
+    mask_r = nonzero & (cmax == r)
+    mask_g = nonzero & (cmax == g) & ~mask_r
+    mask_b = nonzero & ~mask_r & ~mask_g
+    h[mask_r] = ((g[mask_r] - b[mask_r]) / delta[mask_r]).fmod(6.0)
+    h[mask_g] = (b[mask_g] - r[mask_g]) / delta[mask_g] + 2.0
+    h[mask_b] = (r[mask_b] - g[mask_b]) / delta[mask_b] + 4.0
+    h = h * (math.pi / 3.0)  # radians
+
+    # Saturation
+    s = torch.where(cmax > 1e-8, delta / cmax, torch.zeros_like(cmax))
+    return h, s, cmax  # (H, S, V)
+
+
+def _hsv_to_rgb(h: "torch.Tensor", s: "torch.Tensor", v: "torch.Tensor"
+                ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+    """Vectorised HSV→RGB matching ``hsv2rgb`` in shaderflow.glsl."""
+    TAU = 2.0 * math.pi
+    h = h.fmod(TAU)
+    h = torch.where(h < 0, h + TAU, h)  # ensure [0, 2π)
+    c = v * s
+    x = c * (1.0 - ((h / (math.pi / 3.0)).fmod(2.0) - 1.0).abs())
+    m = v - c
+
+    sector = (h / TAU * 6.0).floor().long().clamp(0, 5)
+    r = torch.zeros_like(h)
+    g = torch.zeros_like(h)
+    b = torch.zeros_like(h)
+    for idx, (rv, gv, bv) in enumerate([
+        ("c", "x", "z"), ("x", "c", "z"), ("z", "c", "x"),
+        ("z", "x", "c"), ("x", "z", "c"), ("c", "z", "x"),
+    ]):
+        mask = sector == idx
+        for ch, key in [(r, rv), (g, gv), (b, bv)]:
+            if key == "c":
+                ch[mask] = c[mask]
+            elif key == "x":
+                ch[mask] = x[mask]
+            # "z" → 0 (already initialised)
+    return r + m, g + m, b + m
+
+
+def _smoothstep_t(edge0: float, edge1: float, x: "torch.Tensor") -> "torch.Tensor":
+    """GLSL ``smoothstep`` for tensors."""
+    t = ((x - edge0) / max(edge1 - edge0, 1e-8)).clamp(0, 1)
+    return t * t * (3.0 - 2.0 * t)
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # CUDA Renderer  (PyTorch, no OpenGL)
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -674,8 +735,8 @@ class CudaDepthFlowRenderer:
         pt_x = torch.empty(render_h, render_w, device=dev)
         pt_y = torch.empty(render_h, render_w, device=dev)
 
-        # --- Forward pass — coarser 3× probe, ZERO CPU↔GPU syncs ---------
-        coarse_probe = probe_step * 3.0
+        # --- Forward pass — exact GLSL probe step, ZERO CPU↔GPU syncs ----
+        coarse_probe = probe_step
         n_forward = int(1.0 / coarse_probe) + 2
         for i in range(n_forward):
             walk_f = coarse_probe * (i + 1)                 # Python float
@@ -713,7 +774,7 @@ class CudaDepthFlowRenderer:
             walk_at_hit = torch.where(newly_hit, walk_f, walk_at_hit)
             has_hit = has_hit | newly_hit
 
-        # --- Binary-search backward (12 steps for coarser probe) ----------
+        # --- Binary-search backward (16 steps for fine refinement) --------
         walk_hi = torch.where(has_hit, walk_at_hit, torch.ones_like(walk_at_hit))
         walk_lo = torch.where(
             has_hit,
@@ -721,7 +782,7 @@ class CudaDepthFlowRenderer:
             torch.ones_like(walk_at_hit),
         )
 
-        for _ in range(12):
+        for _ in range(16):
             walk_mid = (walk_lo + walk_hi) * 0.5
             mix_t = safe + (1.0 - safe) * walk_mid            # (H, W)
             ceiling = 1.0 - (orig_z_val * (1.0 - mix_t) + int_z_val * mix_t)
@@ -791,6 +852,9 @@ class CudaDepthFlowRenderer:
         gluv_x, gluv_y = self._make_gluv_grid(render_w, render_h, dev)
         aspect = float(render_w) / float(render_h)
         want_aspect = aspect
+
+        # Scale gluv_x to match GLSL vertex shader: gluv.x ∈ [-aspect, +aspect]
+        gluv_x = gluv_x * want_aspect
 
         mirror = state.mirror
 
@@ -934,14 +998,12 @@ class CudaDepthFlowRenderer:
         # Depth-of-field blur
         elif state.blur_enable:
             depth_val = value.squeeze(0)  # (1, H, W)
-            blur_mix = (1.0 - depth_val).clamp(0, 1)
-            intensity_map = (state.blur_intensity / 100.0) * (
-                ((blur_mix - state.blur_start) / max(state.blur_end - state.blur_start, 1e-4))
-                    .clamp(0, 1)
-                    .pow(state.blur_exponent)
+            smoothstep_val = _smoothstep_t(
+                state.blur_start, state.blur_end, 1.0 - depth_val,
             )
+            intensity_map = state.blur_intensity * smoothstep_val.pow(state.blur_exponent)
             acc_color = color.clone()
-            count = 1.0
+            n_blur_samples = state.blur_directions * state.blur_quality
             tau_val = 2.0 * math.pi
             for d in range(state.blur_directions):
                 angle = tau_val * d / state.blur_directions
@@ -956,17 +1018,16 @@ class CudaDepthFlowRenderer:
                     s = F.grid_sample(self.image_gpu, gr, mode="bilinear",
                                       padding_mode="border", align_corners=False)
                     acc_color += s
-                    count += 1.0
-            fused = acc_color / count
+            fused = acc_color / n_blur_samples
             r, g, b = fused[:, 0:1], fused[:, 1:2], fused[:, 2:3]
 
         # Vignette
         if state.vig_enable:
-            # astuv coordinates [0,1]
-            u_stuv = (gluv_x + 1.0) / 2.0
-            v_stuv = (gluv_y + 1.0) / 2.0
-            away_x = u_stuv * (1.0 - u_stuv)
-            away_y = v_stuv * (1.0 - v_stuv)
+            # astuv coordinates [0,1] — aspect-corrected (matching GLSL)
+            astuv_x = (gluv_x / want_aspect + 1.0) / 2.0
+            astuv_y = (gluv_y + 1.0) / 2.0
+            away_x = astuv_x * (1.0 - astuv_x)
+            away_y = astuv_y * (1.0 - astuv_y)
             linear_v = state.vig_decay * away_x * away_y
             vig_mult = linear_v.pow(state.vig_intensity).clamp(0, 1)
             vig_mult = vig_mult.unsqueeze(0).unsqueeze(0)
@@ -976,11 +1037,9 @@ class CudaDepthFlowRenderer:
 
         # Color adjustments
         if state.color_saturation != 1.0:
-            # RGB→HSV→adjust S→RGB  (fast approximation via luminance)
-            lum = 0.299 * r + 0.587 * g + 0.114 * b
-            r = lum + (r - lum) * state.color_saturation
-            g = lum + (g - lum) * state.color_saturation
-            b = lum + (b - lum) * state.color_saturation
+            h, s, v = _rgb_to_hsv(r, g, b)
+            s = (s * state.color_saturation).clamp(0, 1)
+            r, g, b = _hsv_to_rgb(h, s, v)
 
         if state.color_contrast != 1.0:
             r = ((r - 0.5) * state.color_contrast + 0.5).clamp(0, 1)
