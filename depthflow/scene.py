@@ -105,8 +105,100 @@ class DepthScene(ShaderScene):
         self.image.from_numpy(image)
         self.depth.from_numpy(depth)
 
+        # Keep raw numpy copies for CUDA backend
+        self._raw_image = image
+        self._raw_depth = depth
+
         # Match rendering resolution to image
         self.resolution = self.image.size
+
+    # ------------------------------------------------------------------------ #
+    # CUDA backend — bypass OpenGL entirely
+
+    def cuda_render(
+        self,
+        output: Path | str,
+        width: int = 1920,
+        height: int = 1080,
+        fps: float = 60.0,
+        time: float | None = None,
+        quality: float = 50.0,
+        ssaa: float = 1.0,
+        codec: str = "h264_nvenc",
+        format: str = "mp4",
+    ) -> Path:
+        """Render using CUDA/PyTorch instead of OpenGL/ShaderFlow."""
+        from depthflow.cuda_renderer import (
+            CudaDepthFlowRenderer,
+            DepthFlowState,
+            compute_animation_state,
+            is_available,
+        )
+
+        if not is_available():
+            raise RuntimeError("CUDA not available for DepthFlow rendering")
+
+        # Ensure inputs are loaded
+        if not hasattr(self, "_raw_image"):
+            self.input()
+
+        import numpy as np
+        img = np.asarray(self._raw_image, dtype=np.float32)
+        dep = np.asarray(self._raw_depth, dtype=np.float32)
+        if img.max() > 1.5:
+            img = img / 255.0
+        if dep.max() > 1.5:
+            dep = dep / 255.0
+        if dep.ndim == 3:
+            dep = dep[..., 0]
+
+        renderer = CudaDepthFlowRenderer(img, dep)
+        duration = time or self.runtime or 5.0
+        output = Path(output).with_suffix(f".{format}")
+
+        # Determine animation type and params from self.animation.steps
+        move_type, move_params = self._extract_animation_params()
+
+        renderer.render_video(
+            output_path=str(output),
+            render_w=width,
+            render_h=height,
+            fps=fps,
+            duration=duration,
+            ssaa=ssaa,
+            quality_pct=quality,
+            codec=codec,
+            output_format=format,
+            **move_params,
+        )
+        return output
+
+    def _extract_animation_params(self) -> tuple[str, dict]:
+        """Extract camera_movement type and params from animation steps."""
+        defaults = dict(
+            camera_movement="orbital",
+            intensity=1.0, smooth=True, loop=True,
+            reverse=False, phase=0.0,
+            steady_depth=0.3, isometric_val=0.6,
+        )
+        for step in self.animation.steps:
+            cls_name = type(step).__name__
+            name_map = {
+                "Vertical": "vertical", "Horizontal": "horizontal",
+                "Zoom": "zoom", "Circle": "circle",
+                "Dolly": "dolly", "Orbital": "orbital",
+            }
+            if cls_name in name_map:
+                defaults["camera_movement"] = name_map[cls_name]
+                defaults["intensity"] = getattr(step, "intensity", 1.0)
+                defaults["reverse"] = getattr(step, "reverse", False)
+                defaults["smooth"] = getattr(step, "smooth", True)
+                defaults["loop"] = getattr(step, "loop", True)
+                defaults["phase"] = getattr(step, "phase", 0.0)
+                defaults["steady_depth"] = getattr(step, "steady", 0.3)
+                defaults["isometric_val"] = getattr(step, "isometric", 0.6)
+                break
+        return defaults["camera_movement"], defaults
 
     # ------------------------------------------------------------------------ #
     # Module implementation
