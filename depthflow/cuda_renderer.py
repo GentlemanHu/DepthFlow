@@ -513,6 +513,37 @@ def compute_animation_state(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Depth pre-processing — edge sharpening
+# ────────────────────────────────────────────────────────────────────────────
+
+def _sharpen_depth_for_parallax(depth_gpu: "torch.Tensor") -> "torch.Tensor":
+    """
+    Sharpen depth edges to reduce parallax ghosting at foreground boundaries.
+
+    When depth maps are bilinearly upsampled from a smaller estimation
+    (e.g. DepthAnythingV2: 518×518 → 1024×1024), object edges get a soft
+    transition halo.  This halo causes the ray-march to find intermediate
+    depth values at boundaries, producing ghosting/smearing (模糊/重叠).
+
+    Fix: unsharp-mask to concentrate depth transitions at actual edges.
+    """
+    d = depth_gpu  # (1, 1, H, W)
+    # 5-tap Gaussian kernel
+    k = torch.tensor(
+        [[1, 4, 6, 4, 1],
+         [4,16,24,16, 4],
+         [6,24,36,24, 6],
+         [4,16,24,16, 4],
+         [1, 4, 6, 4, 1]],
+        dtype=torch.float32, device=depth_gpu.device,
+    )
+    k = (k / k.sum()).view(1, 1, 5, 5)
+    blurred = F.conv2d(d, k, padding=2)
+    # Unsharp mask: amount=2.5 amplifies transitions without overshooting
+    return (d + 2.5 * (d - blurred)).clamp(0.0, 1.0)
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # GLSL-matching helpers (HSV, smoothstep)
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -619,6 +650,8 @@ class CudaDepthFlowRenderer:
         # (1, 3, H, W) and (1, 1, H, W)
         self.image_gpu = img.permute(2, 0, 1).unsqueeze(0).to(self.device).contiguous()
         self.depth_gpu = dep.unsqueeze(0).unsqueeze(0).to(self.device).contiguous()
+        # Sharpen depth edges → reduces ghosting / smearing at object silhouettes
+        self.depth_gpu = _sharpen_depth_for_parallax(self.depth_gpu)
 
     # ------------------------------------------------------------------ helpers
 
@@ -744,8 +777,8 @@ class CudaDepthFlowRenderer:
         pt_x = torch.empty(render_h, render_w, device=dev)
         pt_y = torch.empty(render_h, render_w, device=dev)
 
-        # --- Forward pass — 2× probe (binary search gives sub-pixel precision) --
-        coarse_probe = probe_step * 2.0
+        # --- Forward pass — same granularity as native kernel (removed *2) ------
+        coarse_probe = probe_step
         n_forward = int(1.0 / coarse_probe) + 2
         for i in range(n_forward):
             walk_f = coarse_probe * (i + 1)                 # Python float
@@ -961,6 +994,10 @@ class CudaDepthFlowRenderer:
         oob_mask = oob.unsqueeze(0).unsqueeze(0)
         color = torch.where(oob_mask, torch.zeros_like(color), color)
 
+        # Inpaint disocclusion holes at foreground silhouette edges
+        # Fixes: 边缘撕裂 / 重叠 / 模糊 caused by revealed occluded regions
+        color = self._inpaint_disocclusions(color, result_gluv_x, result_gluv_y)
+
         # --- Post-processing (matching GLSL) ------------------------------
         r, g, b = color[:, 0:1], color[:, 1:2], color[:, 2:3]
 
@@ -1086,6 +1123,79 @@ class CudaDepthFlowRenderer:
         frame = frame.clamp(0, 1).mul(255).byte()
         frame = frame.permute(1, 2, 0).contiguous()      # (H, W, 3)
         return frame.cpu()
+
+    # -------------------------------------------------------- inpainting
+
+    @staticmethod
+    @torch.inference_mode()
+    def _inpaint_disocclusions(
+        color: "torch.Tensor",          # (1, 3, H, W) float [0,1]
+        result_gluv_x: "torch.Tensor",  # (H, W)
+        result_gluv_y: "torch.Tensor",  # (H, W)
+        threshold: float = 0.06,
+        iterations: int = 4,
+    ) -> "torch.Tensor":
+        """
+        Fill disocclusion 'holes' at foreground silhouette edges.
+
+        When the camera moves, previously-occluded background regions become
+        visible near the foreground edge.  The ray-march has no colour source
+        for those pixels and replicates neighbours, producing stretched /
+        smeared edges (撕裂 / 重叠 / 锯齿).
+
+        Detection: pixels where the UV-coordinate gradient is abnormally
+        large are disocclusion boundaries.
+
+        Fill: iterative weighted average of the nearest valid (non-disoccluded)
+        neighbours within a 3×3 window, up to ``iterations`` pixels of radius.
+        """
+        # ── Detect disoccluded pixels via UV gradient ────────────────────
+        # Forward finite differences (avoids roll-wrap artefacts)
+        dx = F.pad(
+            (result_gluv_x[:, 1:] - result_gluv_x[:, :-1]).unsqueeze(0).unsqueeze(0),
+            (0, 1, 0, 0),
+        ).squeeze()
+        dy = F.pad(
+            (result_gluv_y[1:, :] - result_gluv_y[:-1, :]).unsqueeze(0).unsqueeze(0),
+            (0, 0, 0, 1),
+        ).squeeze()
+        grad_mag = dx.abs() + dy.abs()      # (H, W)
+        steep = grad_mag > threshold        # (H, W) bool
+
+        if not steep.any():
+            return color
+
+        # ── Iteratively fill steep pixels from valid neighbours ──────────
+        # Uniform 3×3 averaging kernel
+        fill_k = torch.ones(1, 1, 3, 3, dtype=color.dtype, device=color.device) / 9.0
+        valid = (~steep).float()            # (H, W): 1=valid, 0=steep/hole
+        c = color.clone()                   # (1, 3, H, W)
+
+        for _ in range(iterations):
+            if not steep.any():
+                break
+
+            valid_4d = valid.unsqueeze(0).unsqueeze(0)          # (1,1,H,W)
+            # Count valid neighbours for each pixel
+            nb_weight = F.conv2d(valid_4d, fill_k, padding=1)  # (1,1,H,W)
+            # Weighted colour sum — only from valid pixels
+            c_valid = c * valid_4d                              # zero holes
+            nb_color = F.conv2d(
+                c_valid,
+                fill_k.expand(3, 1, 3, 3),                     # per-channel
+                padding=1, groups=3,
+            ) / (nb_weight + 1e-8)                              # (1,3,H,W)
+
+            # Fill: steep pixels that have at least one valid neighbour
+            fillable = steep & (nb_weight.squeeze() > 0)        # (H,W) bool
+            fill_4d  = fillable.unsqueeze(0).unsqueeze(0).expand_as(c)
+            c        = torch.where(fill_4d, nb_color, c)
+
+            # Newly-filled pixels become valid for the next iteration
+            valid = (valid + fillable.float()).clamp(0.0, 1.0)
+            steep = steep & ~fillable
+
+        return c
 
     # ------------------------------------------------------------------ video
 
