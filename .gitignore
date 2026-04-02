@@ -1,2 +1,2 @@
-Workspace
-*__pycache__
+.cache
+site
