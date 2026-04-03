@@ -81,7 +81,7 @@ __device__ __forceinline__ float bilerp(
          +    wx *   wy  * __ldg(&d[y1*w+x1]);
 }
 
-/* ── forward march ───────────────────────────────────────────────────── */
+/* ── forward march (matches GLSL Stage 0 exactly) ────────────────────── */
 
 __global__ void forward_march_k(
     const float* __restrict__ depth,
@@ -100,10 +100,12 @@ __global__ void forward_march_k(
     float o_x = __ldg(&ox[idx]), o_y = __ldg(&oy[idx]);
     float i_x = __ldg(&ix[idx]), i_y = __ldg(&iy[idx]);
 
-    int n = min(__float2int_ru(1.0f / probe) + 2, 500);
-    for (int s = 0; s < n; s++) {
-        float w = probe * (float)(s + 1);
-        if (w > 1.05f) break;
+    // Match GLSL: walk starts at 0, check walk>1.0 BEFORE increment
+    float w = 0.0f;
+    for (int it = 0; it < 1000; it++) {
+        if (w > 1.0f) break;
+        w += probe;
+
         float mt = safe + (1.0f - safe) * w;
         float c1 = 1.0f - mt;
         float px = o_x * c1 + i_x * mt;
@@ -121,7 +123,7 @@ __global__ void forward_march_k(
     hit_out[idx] = 0;
 }
 
-/* ── backward linear refinement (matches GLSL Stage 1) ───────────────── */
+/* ── backward linear refinement (matches GLSL Stage 1 exactly) ────────── */
 
 __global__ void backward_refine_k(
     const float* __restrict__ depth,
@@ -140,11 +142,14 @@ __global__ void backward_refine_k(
     float o_x = __ldg(&ox[idx]), o_y = __ldg(&oy[idx]);
     float i_x = __ldg(&ix[idx]), i_y = __ldg(&iy[idx]);
     float w = walk_in[idx];
+    float last_value = 0.0f;
 
-    // Walk backwards with tiny steps until we exit the surface
-    for (int s = 0; s < 2000; s++) {
+    // Match GLSL Stage 1: walk backwards, stop when outside surface
+    for (int it = 0; it < 1000; it++) {
         w -= quality_step;
-        if (w < 0.0f) { w = 0.0f; break; }
+        // GLSL does NOT clamp walk < 0. Match this.
+        // In practice we clamp at a safe minimum to avoid garbage.
+        if (w < -0.1f) { w = 0.0f; break; }
 
         float mt = safe + (1.0f - safe) * w;
         float c1 = 1.0f - mt;
@@ -156,10 +161,11 @@ __global__ void backward_refine_k(
         float dv = bilerp(depth, iw, ih, gx, gy);
         float surf = dh * (dv * (1.0f - di) + (1.0f - dv) * di);
 
-        // Outside the surface — this is our answer
-        if (surf <= ceil_v) break;
+        // GLSL: ceiling < surface → inside (continue)
+        //       else (BACKWARD) → break (found outside edge)
+        if (ceil_v >= surf) break;  // outside → this is our answer
     }
-    walk_out[idx] = w;
+    walk_out[idx] = fmaxf(w, 0.0f);
 }
 
 /* ── walk → gluv recovery ────────────────────────────────────────────── */
@@ -286,7 +292,7 @@ def _get_native_module():
         os.environ["PATH"] = ninja.BIN_DIR + os.pathsep + os.environ.get("PATH", "")
         from torch.utils.cpp_extension import load_inline
         _NATIVE_MODULE = load_inline(
-            name="depthflow_native_v2",
+            name="depthflow_native_v3",
             cpp_sources=_CPP_SRC,
             cuda_sources=_CUDA_SRC,
             functions=[
@@ -777,22 +783,20 @@ class CudaDepthFlowRenderer:
         pt_x = torch.empty(render_h, render_w, device=dev)
         pt_y = torch.empty(render_h, render_w, device=dev)
 
-        # --- Forward pass — same granularity as native kernel (removed *2) ------
-        coarse_probe = probe_step
-        n_forward = int(1.0 / coarse_probe) + 2
-        for i in range(n_forward):
-            walk_f = coarse_probe * (i + 1)                 # Python float
-            if walk_f > 1.05:
+        # --- Forward pass (matches GLSL Stage 0 exactly) ---------------------
+        # GLSL: walk starts at 0; check walk>1.0 BEFORE incrementing
+        walk_f = 0.0
+        for _ in range(1000):
+            if walk_f > 1.0:
                 break
+            walk_f += probe_step
 
-            mix_t_f = safe + (1.0 - safe) * walk_f         # Python float
+            mix_t_f = safe + (1.0 - safe) * walk_f
             ceiling_f = 1.0 - (orig_z_val * (1.0 - mix_t_f) + int_z_val * mix_t_f)
 
-            # pt = orig + dir * mix_t  → fused add+mul
             torch.add(orig_x, dir_x, alpha=mix_t_f, out=pt_x)
             torch.add(orig_y, dir_y, alpha=mix_t_f, out=pt_y)
 
-            # Fill grid in-place
             if mirror:
                 gx = want_aspect * _triangle_wave_t(pt_x, 4.0 * want_aspect)
                 gy = _triangle_wave_t(pt_y, 4.0)
@@ -811,21 +815,22 @@ class CudaDepthFlowRenderer:
                 d_val * (1.0 - df_invert) + (1.0 - d_val) * df_invert
             )
 
-            # ceiling is a Python float ─ fast scalar broadcast
             newly_hit = (~has_hit) & (surface > ceiling_f)
             walk_at_hit = torch.where(newly_hit, walk_f, walk_at_hit)
             has_hit = has_hit | newly_hit
 
-        # --- Backward linear refinement (matches GLSL Stage 1) -----------
+        # --- Backward linear refinement (matches GLSL Stage 1 exactly) ---
         quality_step = 1.0 / (200.0 + 1800.0 * quality_norm)
-        n_backward = int(coarse_probe / quality_step) + 10
 
         # For no-hit pixels, walk stays at 1.0 (→ intersect)
         walk_result = torch.where(has_hit, walk_at_hit, torch.ones_like(walk_at_hit))
         refining = has_hit.clone()
 
-        for _ in range(n_backward):
-            walk_cand = (walk_result - quality_step).clamp(min=0.0)
+        # Match GLSL: up to 1000 backward iterations (early exit when all done)
+        for _ in range(1000):
+            walk_cand = walk_result - quality_step
+            # GLSL doesn't clamp < 0, but safe minimum
+            walk_cand = walk_cand.clamp(min=-0.1)
             mix_t = safe + (1.0 - safe) * walk_cand
             ceiling = 1.0 - (orig_z_val * (1.0 - mix_t) + int_z_val * mix_t)
 
@@ -849,16 +854,15 @@ class CudaDepthFlowRenderer:
             surface = df_height * (
                 d_val * (1.0 - df_invert) + (1.0 - d_val) * df_invert
             )
-            # Still inside → keep walking backward
+            # GLSL: ceiling >= surface → outside → stop
             still_inside = refining & (surface > ceiling)
             walk_result = torch.where(still_inside, walk_cand, walk_result)
-            # Exited → stop refining this pixel
             refining = still_inside
 
             if not refining.any():
                 break
 
-        walk_lo = walk_result
+        walk_lo = walk_result.clamp(min=0.0)
 
         # Final result — matches GLSL: no-hit pixels have walk_lo=1.0 → intersect
         mix_t = safe + (1.0 - safe) * walk_lo
