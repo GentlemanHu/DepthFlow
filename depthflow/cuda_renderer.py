@@ -611,6 +611,7 @@ class CudaDepthFlowRenderer:
         image: Any,
         depth: Any,
         device: str = "cuda",
+        depth_post_process: bool = True,
     ) -> None:
         if not _check_cuda():
             raise RuntimeError("CUDA not available — cannot use CudaDepthFlowRenderer")
@@ -627,7 +628,34 @@ class CudaDepthFlowRenderer:
         self.image_gpu = img.permute(2, 0, 1).unsqueeze(0).to(self.device).contiguous()
         self.depth_gpu = dep.unsqueeze(0).unsqueeze(0).to(self.device).contiguous()
 
+        # Match DepthFlow DA2 depth post-processing:
+        # 1) Gaussian blur σ=0.6 — smooth high-frequency noise
+        # 2) 5×5 max-pool (dilation) — thicken foreground edges to prevent
+        #    background pixels from "peeking through" at silhouette boundaries
+        if depth_post_process:
+            self.depth_gpu = self._post_process_depth(self.depth_gpu)
+
     # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _post_process_depth(depth_gpu: "torch.Tensor") -> "torch.Tensor":
+        """Match DepthFlow DA2 _post(): Gaussian(σ=0.6) + MaxPool(5)."""
+        # Gaussian blur kernel (7×7, σ=0.6)
+        sigma = 0.6
+        ks = 7  # kernel size (must be odd)
+        half = ks // 2
+        coords = torch.arange(ks, dtype=torch.float32, device=depth_gpu.device) - half
+        g1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+        g1d = g1d / g1d.sum()
+        kernel = g1d.unsqueeze(1) * g1d.unsqueeze(0)  # (ks, ks)
+        kernel = kernel.unsqueeze(0).unsqueeze(0)      # (1, 1, ks, ks)
+        blurred = F.conv2d(
+            F.pad(depth_gpu, (half, half, half, half), mode="replicate"),
+            kernel,
+        )
+        # 5×5 max-pool (foreground edge dilation, stride=1)
+        dilated = F.max_pool2d(blurred, kernel_size=5, stride=1, padding=2)
+        return dilated
 
     def _to_tensor(self, x: Any) -> torch.Tensor:
         if isinstance(x, torch.Tensor):
@@ -1090,6 +1118,20 @@ class CudaDepthFlowRenderer:
 
         # Reassemble (1, 3, H, W) → (H, W, 3) uint8
         frame = torch.cat([r, g, b], dim=1).squeeze(0)  # (3, H, W)
+
+        # Match ShaderFlow's default subsample=2 final pass:
+        # 2×2 subpixel averaging with bilinear — equivalent to a
+        # separable [1, 6, 1]/8 tent filter (centre ≈ 56%).
+        _aa_k = torch.tensor([1.0, 6.0, 1.0], device=frame.device) / 8.0
+        _aa_kh = _aa_k.view(1, 1, 1, 3).expand(3, 1, 1, 3)   # horizontal
+        _aa_kv = _aa_k.view(1, 1, 3, 1).expand(3, 1, 3, 1)   # vertical
+        f4d = frame.unsqueeze(0)                               # (1, 3, H, W)
+        f4d = F.conv2d(F.pad(f4d, (1, 1, 0, 0), mode="replicate"),
+                       _aa_kh, groups=3)
+        f4d = F.conv2d(F.pad(f4d, (0, 0, 1, 1), mode="replicate"),
+                       _aa_kv, groups=3)
+        frame = f4d.squeeze(0)                                 # (3, H, W)
+
         frame = frame.clamp(0, 1).mul(255).byte()
         frame = frame.permute(1, 2, 0).contiguous()      # (H, W, 3)
         return frame.cpu()
