@@ -518,36 +518,6 @@ def compute_animation_state(
     return state
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Depth pre-processing — edge sharpening
-# ────────────────────────────────────────────────────────────────────────────
-
-def _sharpen_depth_for_parallax(depth_gpu: "torch.Tensor") -> "torch.Tensor":
-    """
-    Sharpen depth edges to reduce parallax ghosting at foreground boundaries.
-
-    When depth maps are bilinearly upsampled from a smaller estimation
-    (e.g. DepthAnythingV2: 518×518 → 1024×1024), object edges get a soft
-    transition halo.  This halo causes the ray-march to find intermediate
-    depth values at boundaries, producing ghosting/smearing (模糊/重叠).
-
-    Fix: unsharp-mask to concentrate depth transitions at actual edges.
-    """
-    d = depth_gpu  # (1, 1, H, W)
-    # 5-tap Gaussian kernel
-    k = torch.tensor(
-        [[1, 4, 6, 4, 1],
-         [4,16,24,16, 4],
-         [6,24,36,24, 6],
-         [4,16,24,16, 4],
-         [1, 4, 6, 4, 1]],
-        dtype=torch.float32, device=depth_gpu.device,
-    )
-    k = (k / k.sum()).view(1, 1, 5, 5)
-    blurred = F.conv2d(d, k, padding=2)
-    # Unsharp mask: amount=2.5 amplifies transitions without overshooting
-    return (d + 2.5 * (d - blurred)).clamp(0.0, 1.0)
-
 
 # ────────────────────────────────────────────────────────────────────────────
 # GLSL-matching helpers (HSV, smoothstep)
@@ -656,8 +626,6 @@ class CudaDepthFlowRenderer:
         # (1, 3, H, W) and (1, 1, H, W)
         self.image_gpu = img.permute(2, 0, 1).unsqueeze(0).to(self.device).contiguous()
         self.depth_gpu = dep.unsqueeze(0).unsqueeze(0).to(self.device).contiguous()
-        # Sharpen depth edges → reduces ghosting / smearing at object silhouettes
-        self.depth_gpu = _sharpen_depth_for_parallax(self.depth_gpu)
 
     # ------------------------------------------------------------------ helpers
 
@@ -998,9 +966,7 @@ class CudaDepthFlowRenderer:
         oob_mask = oob.unsqueeze(0).unsqueeze(0)
         color = torch.where(oob_mask, torch.zeros_like(color), color)
 
-        # Inpaint disocclusion holes at foreground silhouette edges
-        # Fixes: 边缘撕裂 / 重叠 / 模糊 caused by revealed occluded regions
-        color = self._inpaint_disocclusions(color, result_gluv_x, result_gluv_y)
+
 
         # --- Post-processing (matching GLSL) ------------------------------
         r, g, b = color[:, 0:1], color[:, 1:2], color[:, 2:3]
