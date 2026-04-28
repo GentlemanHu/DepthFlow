@@ -1229,19 +1229,21 @@ class CudaDepthFlowRenderer:
             # Depth edge: where gradient is significantly above average
             depth_mean = depth_grad.mean()
             depth_std = depth_grad.std()
-            depth_edge = depth_grad > (depth_mean + 1.5 * depth_std)
-            # Combine: require both UV tear AND depth edge
-            # This prevents inpainting on textured flat surfaces
-            steep = steep & depth_edge
+            # Aggressive detection: Union of UV tears and Depth edges
+            # Also catch pixels where depth is significantly stretched
+            steep = steep | depth_edge
+
 
         if not steep.any():
             return color
 
         # ── 3. Mask dilation ─────────────────────────────────────────────
-        # Dilate by 1 pixel to catch fringe/border pixels around the tear
+        # Dilate aggressively based on iteration count to swallow long streaks
+        dial_radius = max(2, iterations // 3)
         steep_float = steep.float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-        steep = F.max_pool2d(steep_float, kernel_size=3, stride=1, padding=1)
+        steep = F.max_pool2d(steep_float, kernel_size=dial_radius*2+1, stride=1, padding=dial_radius)
         steep = steep.squeeze() > 0.5  # back to (H, W) bool
+
 
         # ── 4. Iterative fill ────────────────────────────────────────────
         # 3×3 uniform kernel (shared across channels via groups)
@@ -1255,22 +1257,27 @@ class CudaDepthFlowRenderer:
 
             valid_4d = valid.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
 
-            # Count valid neighbours for each pixel
-            nb_weight = F.conv2d(
-                F.pad(valid_4d, (1, 1, 1, 1), mode="constant", value=0),
-                fill_k,
-            )  # (1,1,H,W)
+            # Background-prioritized fill:
+            # We want to sample background colors for sky holes, not hair colors.
+            # Use depth_value to weight neighbors: deeper pixels (lower values) get more weight.
+            if depth_aware and depth_value is not None:
+                dv_4d = depth_value.detach()
+                # Weight = e^(-5*depth) * valid_mask. In DepthFlow, 0=bg, 1=fg.
+                # So we want low depth values to have high weight.
+                d_weight = torch.exp(-5.0 * dv_4d) * valid_4d
+                nb_weight = F.conv2d(F.pad(d_weight, (1, 1, 1, 1), mode="constant", value=0), fill_k)
+                nb_color = F.conv2d(
+                    F.pad(c * d_weight, (1, 1, 1, 1), mode="constant", value=0),
+                    fill_k.expand(3, 1, 3, 3), groups=3
+                )
+            else:
+                nb_weight = F.conv2d(F.pad(valid_4d, (1, 1, 1, 1), mode="constant", value=0), fill_k)
+                nb_color = F.conv2d(
+                    F.pad(c * valid_4d, (1, 1, 1, 1), mode="constant", value=0),
+                    fill_k.expand(3, 1, 3, 3), groups=3
+                )
 
-            # Weighted colour sum — only from valid pixels
-            # Zero out hole pixels so they don't pollute the average
-            c_valid = c * valid_4d  # (1,3,H,W) — holes are zeroed
-            nb_color = F.conv2d(
-                F.pad(c_valid, (1, 1, 1, 1), mode="constant", value=0),
-                fill_k.expand(3, 1, 3, 3),
-                groups=3,
-            )  # (1,3,H,W)
-
-            # Normalize by valid neighbour count
+            # Normalize by weights
             safe_weight = nb_weight.clamp(min=1e-8)
             nb_color = nb_color / safe_weight
 
