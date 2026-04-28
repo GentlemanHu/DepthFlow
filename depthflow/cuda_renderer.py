@@ -888,9 +888,8 @@ class CudaDepthFlowRenderer:
         render_h: int,
         state: DepthFlowState,
         quality_pct: float = 50.0,
-        enable_inpaint: bool = True,
-        inpaint_threshold: float = 0.5,
-        inpaint_blur: int = 5,
+        enable_inpaint: bool = False,
+        inpaint_threshold: float = 3.0,
         enable_aa: bool = True,
     ) -> torch.Tensor:
         """Render one frame.  Returns (H, W, 3) uint8 tensor on CPU."""
@@ -994,35 +993,16 @@ class CudaDepthFlowRenderer:
                               padding_mode="border", align_corners=False)
         # color: (1, 3, H, W)
 
-        # --- Flat projection color (NO depth, original image) -------------
-        # This is the image sampled at the camera-projected UV without any
-        # depth displacement — matches GLSL's base `gtexture(image, gluv)`
-        flat_grid = self._gluv_to_grid(cam_gluv_x, cam_gluv_y,
-                                        mirror, want_aspect)
-        flat_color = F.grid_sample(self.image_gpu, flat_grid, mode="bilinear",
-                                    padding_mode="border", align_corners=False)
-
-        # --- Disocclusion repair: steep detection + flat fallback ----------
+        # --- Edge soften: blur only at depth-discontinuity edges ----------
+        # Detects pixels where the ray-marched UV jumps abnormally (stretched
+        # edges at foreground silhouettes) and applies a targeted Gaussian
+        # blur only at those pixels. No perspective mixing = no ghosting.
         if enable_inpaint:
-            steep_mask = self._compute_steep_mask(
-                result_gluv_x, result_gluv_y, value,
-                quality_norm, df_height, threshold=inpaint_threshold,
-            )  # (H, W) float [0, 1]
-
-            if steep_mask.any():
-                # Soft-blend: smooth the binary mask for gradual transition
-                sm = steep_mask.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-                if inpaint_blur > 0:
-                    ks = inpaint_blur * 2 + 1  # ensure odd
-                    sm = F.avg_pool2d(
-                        F.pad(sm, (inpaint_blur, inpaint_blur,
-                                   inpaint_blur, inpaint_blur),
-                              mode="replicate"),
-                        kernel_size=ks, stride=1,
-                    )
-                sm = sm.clamp(0.0, 1.0)  # (1,1,H,W)
-                # Blend: steep → flat_color,  non-steep → ray-marched color
-                color = color * (1.0 - sm) + flat_color * sm
+            color = self._edge_soften(
+                color, result_gluv_x, result_gluv_y,
+                render_w, render_h, want_aspect,
+                threshold=inpaint_threshold,
+            )
 
         # Apply OOB mask
         oob_mask = oob.unsqueeze(0).unsqueeze(0)
@@ -1170,74 +1150,72 @@ class CudaDepthFlowRenderer:
         frame = frame.permute(1, 2, 0).contiguous()      # (H, W, 3)
         return frame.cpu()
 
-    # ------------------------------------------------------ steep detection
+    # -------------------------------------------------------- edge soften
 
     @staticmethod
     @torch.inference_mode()
-    def _compute_steep_mask(
+    def _edge_soften(
+        color: "torch.Tensor",          # (1, 3, H, W) float [0,1]
         result_gluv_x: "torch.Tensor",  # (H, W)
         result_gluv_y: "torch.Tensor",  # (H, W)
-        depth_value: "torch.Tensor",    # (1, 1, H, W)
-        quality_norm: float,
-        df_height: float,
-        threshold: float = 0.5,
+        render_w: int,
+        render_h: int,
+        aspect: float,
+        threshold: float = 3.0,
     ) -> "torch.Tensor":
         """
-        Compute a steepness mask matching the GLSL DepthFlow reference.
+        Soften stretched edges at depth discontinuities.
 
-        GLSL computes:
-          derivative = (last_value - value) / quality_step
-          normal = normalize(vec3(dDepth/dx, dDepth/dy, max(height, step)))
-          steep = derivative * angle(normal, vec3(0,0,1))
+        Detects pixels where the ray-marched UV coordinate jumps much more
+        than the expected per-pixel UV step (= foreground silhouette edges
+        where texels are stretched across disoccluded gaps).
 
-        We replicate this with finite differences on the ray-marched UV
-        and depth map, producing a [0,1] float mask where 1 = fully steep
-        (disocclusion / stretching artifact).
+        Instead of mixing a different perspective (which causes ghosting),
+        we apply a small Gaussian blur *only* at those stretched pixels.
+        This softens the stretching artifact without introducing any new
+        visual errors.
 
-        Returns (H, W) float mask [0, 1].
+        Parameters:
+            threshold: how many times the expected UV step before a pixel
+                       is considered 'stretched'. 3.0 = 3x normal gradient.
+                       Lower = more aggressive softening.
         """
-        dev = result_gluv_x.device
-        quality_step = 1.0 / (200.0 + 1800.0 * quality_norm)
+        dev = color.device
 
-        # ── UV-space derivative (proxy for GLSL's depth derivative) ──────
-        # Forward differences on the result UV coordinates
-        dx_u = F.pad(
-            (result_gluv_x[:, 1:] - result_gluv_x[:, :-1]).unsqueeze(0).unsqueeze(0),
-            (0, 1, 0, 0), mode="replicate",
-        ).squeeze()  # (H, W)
-        dy_v = F.pad(
-            (result_gluv_y[1:, :] - result_gluv_y[:-1, :]).unsqueeze(0).unsqueeze(0),
-            (0, 0, 0, 1), mode="replicate",
-        ).squeeze()  # (H, W)
+        # Expected UV change per pixel for an undistorted projection
+        expected_dx = 2.0 * aspect / render_w
+        expected_dy = 2.0 / render_h
 
-        # UV gradient magnitude — large where ray-march UV jumps (disocclusion)
-        uv_deriv = (dx_u.abs() + dy_v.abs()) / max(quality_step, 1e-6)
+        # Actual UV change per pixel (forward differences)
+        dx = (result_gluv_x[:, 1:] - result_gluv_x[:, :-1]).abs()
+        dy = (result_gluv_y[1:, :] - result_gluv_y[:-1, :]).abs()
 
-        # ── Surface normal from depth map ────────────────────────────────
-        dv = depth_value.squeeze()  # (H, W)
-        d_dx = F.pad(
-            (dv[:, 1:] - dv[:, :-1]).unsqueeze(0).unsqueeze(0),
-            (0, 1, 0, 0), mode="replicate",
-        ).squeeze() / max(quality_step, 1e-6)
-        d_dy = F.pad(
-            (dv[1:, :] - dv[:-1, :]).unsqueeze(0).unsqueeze(0),
-            (0, 0, 0, 1), mode="replicate",
-        ).squeeze() / max(quality_step, 1e-6)
+        # Stretch ratio: how much larger is actual vs expected
+        stretch_x = F.pad(dx.unsqueeze(0).unsqueeze(0),
+                          (0, 1, 0, 0), mode="replicate").squeeze()
+        stretch_y = F.pad(dy.unsqueeze(0).unsqueeze(0),
+                          (0, 0, 0, 1), mode="replicate").squeeze()
+        stretch = (stretch_x / max(expected_dx, 1e-8) +
+                   stretch_y / max(expected_dy, 1e-8)) * 0.5  # (H, W)
 
-        nz = max(df_height, quality_step)
-        normal_len = (d_dx ** 2 + d_dy ** 2 + nz ** 2).sqrt()
-        cos_angle = nz / normal_len.clamp(min=1e-8)  # cos(angle to z-axis)
-        # angle = acos(cos) — but we only need a monotonic proxy:
-        # angle ∈ [0, π/2], sin(angle) = sqrt(1 - cos²) is simpler
-        sin_angle = (1.0 - cos_angle ** 2).clamp(min=0.0).sqrt()
+        # Mask: pixels with stretch > threshold
+        mask = ((stretch - threshold) / max(threshold, 1e-8)).clamp(0.0, 1.0)
 
-        # ── Steepness = derivative × angle (matching GLSL) ───────────────
-        steep_raw = uv_deriv * sin_angle  # (H, W)
+        if mask.max() < 1e-4:
+            return color
 
-        # Normalize to [0, 1] with soft threshold
-        steep_mask = (steep_raw / max(threshold, 1e-6)).clamp(0.0, 1.0)
+        # 5×5 Gaussian blur of the color (σ ≈ 1.0)
+        gk = torch.tensor([1, 4, 6, 4, 1], dtype=color.dtype, device=dev) / 16.0
+        gk2d = (gk.unsqueeze(1) * gk.unsqueeze(0))  # (5, 5)
+        gk2d = gk2d.unsqueeze(0).unsqueeze(0).expand(3, 1, 5, 5)  # (3,1,5,5)
+        blurred = F.conv2d(
+            F.pad(color, (2, 2, 2, 2), mode="replicate"),
+            gk2d, groups=3,
+        )  # (1, 3, H, W)
 
-        return steep_mask
+        # Blend: stretched pixels get blurred, clean pixels untouched
+        mask_4d = mask.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        return color * (1.0 - mask_4d) + blurred * mask_4d
 
     # ------------------------------------------------------------------ video
 
@@ -1262,9 +1240,8 @@ class CudaDepthFlowRenderer:
         output_format: str = "mp4",
         progress_cb: Optional[Callable[[int, int], None]] = None,
         capture_frames: int = 0,
-        enable_inpaint: bool = True,
-        inpaint_threshold: float = 0.5,
-        inpaint_blur: int = 5,
+        enable_inpaint: bool = False,
+        inpaint_threshold: float = 3.0,
         enable_aa: bool = True,
     ) -> str:
         """Render a full parallax video to *output_path*.
@@ -1335,7 +1312,6 @@ class CudaDepthFlowRenderer:
                     ssaa_w, ssaa_h, state, quality_pct,
                     enable_inpaint=enable_inpaint,
                     inpaint_threshold=inpaint_threshold,
-                    inpaint_blur=inpaint_blur,
                     enable_aa=enable_aa,
                 )
                 proc.stdin.write(frame.numpy().tobytes())
