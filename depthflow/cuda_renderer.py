@@ -888,6 +888,11 @@ class CudaDepthFlowRenderer:
         render_h: int,
         state: DepthFlowState,
         quality_pct: float = 50.0,
+        enable_inpaint: bool = True,
+        inpaint_threshold: float = 0.04,
+        inpaint_iterations: int = 6,
+        inpaint_depth_aware: bool = True,
+        enable_aa: bool = True,
     ) -> torch.Tensor:
         """Render one frame.  Returns (H, W, 3) uint8 tensor on CPU."""
         dev = self.device
@@ -994,6 +999,17 @@ class CudaDepthFlowRenderer:
         oob_mask = oob.unsqueeze(0).unsqueeze(0)
         color = torch.where(oob_mask, torch.zeros_like(color), color)
 
+        # --- Disocclusion inpaint (before post-processing / AA) -----------
+        if enable_inpaint and self._should_inpaint(state):
+            color = self._inpaint_disocclusions(
+                color=color,
+                result_gluv_x=result_gluv_x,
+                result_gluv_y=result_gluv_y,
+                depth_value=value,
+                threshold=inpaint_threshold,
+                iterations=inpaint_iterations,
+                depth_aware=inpaint_depth_aware,
+            )
 
 
         # --- Post-processing (matching GLSL) ------------------------------
@@ -1122,15 +1138,16 @@ class CudaDepthFlowRenderer:
         # Match ShaderFlow's default subsample=2 final pass:
         # 2×2 subpixel averaging with bilinear — equivalent to a
         # separable [1, 6, 1]/8 tent filter (centre ≈ 56%).
-        _aa_k = torch.tensor([1.0, 6.0, 1.0], device=frame.device) / 8.0
-        _aa_kh = _aa_k.view(1, 1, 1, 3).expand(3, 1, 1, 3)   # horizontal
-        _aa_kv = _aa_k.view(1, 1, 3, 1).expand(3, 1, 3, 1)   # vertical
-        f4d = frame.unsqueeze(0)                               # (1, 3, H, W)
-        f4d = F.conv2d(F.pad(f4d, (1, 1, 0, 0), mode="replicate"),
-                       _aa_kh, groups=3)
-        f4d = F.conv2d(F.pad(f4d, (0, 0, 1, 1), mode="replicate"),
-                       _aa_kv, groups=3)
-        frame = f4d.squeeze(0)                                 # (3, H, W)
+        if enable_aa:
+            _aa_k = torch.tensor([1.0, 6.0, 1.0], device=frame.device) / 8.0
+            _aa_kh = _aa_k.view(1, 1, 1, 3).expand(3, 1, 1, 3)   # horizontal
+            _aa_kv = _aa_k.view(1, 1, 3, 1).expand(3, 1, 3, 1)   # vertical
+            f4d = frame.unsqueeze(0)                               # (1, 3, H, W)
+            f4d = F.conv2d(F.pad(f4d, (1, 1, 0, 0), mode="replicate"),
+                           _aa_kh, groups=3)
+            f4d = F.conv2d(F.pad(f4d, (0, 0, 1, 1), mode="replicate"),
+                           _aa_kv, groups=3)
+            frame = f4d.squeeze(0)                                 # (3, H, W)
 
         frame = frame.clamp(0, 1).mul(255).byte()
         frame = frame.permute(1, 2, 0).contiguous()      # (H, W, 3)
@@ -1139,13 +1156,28 @@ class CudaDepthFlowRenderer:
     # -------------------------------------------------------- inpainting
 
     @staticmethod
+    def _should_inpaint(state: "DepthFlowState") -> bool:
+        """Return True if the current state has any camera movement that
+        would produce disocclusion artifacts worth inpainting."""
+        return (
+            abs(state.offset_x) > 1e-5 or
+            abs(state.offset_y) > 1e-5 or
+            abs(state.height - 0.2) > 1e-5 or
+            abs(state.isometric) > 1e-5 or
+            abs(state.dolly) > 1e-5 or
+            abs(state.zoom - 1.0) > 1e-5
+        )
+
+    @staticmethod
     @torch.inference_mode()
     def _inpaint_disocclusions(
-        color: "torch.Tensor",          # (1, 3, H, W) float [0,1]
-        result_gluv_x: "torch.Tensor",  # (H, W)
-        result_gluv_y: "torch.Tensor",  # (H, W)
-        threshold: float = 0.06,
-        iterations: int = 4,
+        color: "torch.Tensor",             # (1, 3, H, W) float [0,1]
+        result_gluv_x: "torch.Tensor",     # (H, W)
+        result_gluv_y: "torch.Tensor",     # (H, W)
+        depth_value: Optional["torch.Tensor"] = None,  # (1, 1, H, W) float
+        threshold: float = 0.04,
+        iterations: int = 6,
+        depth_aware: bool = True,
     ) -> "torch.Tensor":
         """
         Fill disocclusion 'holes' at foreground silhouette edges.
@@ -1153,16 +1185,23 @@ class CudaDepthFlowRenderer:
         When the camera moves, previously-occluded background regions become
         visible near the foreground edge.  The ray-march has no colour source
         for those pixels and replicates neighbours, producing stretched /
-        smeared edges (撕裂 / 重叠 / 锯齿).
+        smeared edges.
 
-        Detection: pixels where the UV-coordinate gradient is abnormally
-        large are disocclusion boundaries.
-
-        Fill: iterative weighted average of the nearest valid (non-disoccluded)
-        neighbours within a 3×3 window, up to ``iterations`` pixels of radius.
+        Algorithm:
+        1. UV gradient mask — detect pixels where the UV coordinate gradient
+           is abnormally large (disocclusion boundaries).
+        2. Depth-aware mask — combine with depth edge detection to reduce
+           false positives on textured flat surfaces.
+        3. Mask dilation — expand the mask slightly to catch fringe pixels.
+        4. Iterative fill — weighted-average from valid (non-disoccluded)
+           neighbours via 3×3 conv2d, with confidence blending.
+        5. Foreground protection — holes don't contribute to the average;
+           only valid neighbours participate.
         """
-        # ── Detect disoccluded pixels via UV gradient ────────────────────
-        # Forward finite differences (avoids roll-wrap artefacts)
+        dev = color.device
+
+        # ── 1. UV gradient mask ──────────────────────────────────────────
+        # Forward finite differences
         dx = F.pad(
             (result_gluv_x[:, 1:] - result_gluv_x[:, :-1]).unsqueeze(0).unsqueeze(0),
             (0, 1, 0, 0),
@@ -1171,39 +1210,87 @@ class CudaDepthFlowRenderer:
             (result_gluv_y[1:, :] - result_gluv_y[:-1, :]).unsqueeze(0).unsqueeze(0),
             (0, 0, 0, 1),
         ).squeeze()
-        grad_mag = dx.abs() + dy.abs()      # (H, W)
-        steep = grad_mag > threshold        # (H, W) bool
+        uv_grad = dx.abs() + dy.abs()  # (H, W)
+        steep = uv_grad > threshold    # (H, W) bool
+
+        # ── 2. Depth-aware mask ──────────────────────────────────────────
+        if depth_aware and depth_value is not None:
+            dv = depth_value.squeeze()  # (H, W)
+            # Depth gradient
+            d_dx = F.pad(
+                (dv[:, 1:] - dv[:, :-1]).unsqueeze(0).unsqueeze(0),
+                (0, 1, 0, 0),
+            ).squeeze()
+            d_dy = F.pad(
+                (dv[1:, :] - dv[:-1, :]).unsqueeze(0).unsqueeze(0),
+                (0, 0, 0, 1),
+            ).squeeze()
+            depth_grad = d_dx.abs() + d_dy.abs()  # (H, W)
+            # Depth edge: where gradient is significantly above average
+            depth_mean = depth_grad.mean()
+            depth_std = depth_grad.std()
+            depth_edge = depth_grad > (depth_mean + 1.5 * depth_std)
+            # Combine: require both UV tear AND depth edge
+            # This prevents inpainting on textured flat surfaces
+            steep = steep & depth_edge
 
         if not steep.any():
             return color
 
-        # ── Iteratively fill steep pixels from valid neighbours ──────────
-        # Uniform 3×3 averaging kernel
-        fill_k = torch.ones(1, 1, 3, 3, dtype=color.dtype, device=color.device) / 9.0
-        valid = (~steep).float()            # (H, W): 1=valid, 0=steep/hole
-        c = color.clone()                   # (1, 3, H, W)
+        # ── 3. Mask dilation ─────────────────────────────────────────────
+        # Dilate by 1 pixel to catch fringe/border pixels around the tear
+        steep_float = steep.float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        steep = F.max_pool2d(steep_float, kernel_size=3, stride=1, padding=1)
+        steep = steep.squeeze() > 0.5  # back to (H, W) bool
+
+        # ── 4. Iterative fill ────────────────────────────────────────────
+        # 3×3 uniform kernel (shared across channels via groups)
+        fill_k = torch.ones(1, 1, 3, 3, dtype=color.dtype, device=dev) / 9.0
+        valid = (~steep).float()  # (H, W): 1=valid, 0=hole
+        c = color.clone()         # (1, 3, H, W)
 
         for _ in range(iterations):
             if not steep.any():
                 break
 
-            valid_4d = valid.unsqueeze(0).unsqueeze(0)          # (1,1,H,W)
+            valid_4d = valid.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+
             # Count valid neighbours for each pixel
-            nb_weight = F.conv2d(valid_4d, fill_k, padding=1)  # (1,1,H,W)
+            nb_weight = F.conv2d(
+                F.pad(valid_4d, (1, 1, 1, 1), mode="constant", value=0),
+                fill_k,
+            )  # (1,1,H,W)
+
             # Weighted colour sum — only from valid pixels
-            c_valid = c * valid_4d                              # zero holes
+            # Zero out hole pixels so they don't pollute the average
+            c_valid = c * valid_4d  # (1,3,H,W) — holes are zeroed
             nb_color = F.conv2d(
-                c_valid,
-                fill_k.expand(3, 1, 3, 3),                     # per-channel
-                padding=1, groups=3,
-            ) / (nb_weight + 1e-8)                              # (1,3,H,W)
+                F.pad(c_valid, (1, 1, 1, 1), mode="constant", value=0),
+                fill_k.expand(3, 1, 3, 3),
+                groups=3,
+            )  # (1,3,H,W)
 
-            # Fill: steep pixels that have at least one valid neighbour
-            fillable = steep & (nb_weight.squeeze() > 0)        # (H,W) bool
-            fill_4d  = fillable.unsqueeze(0).unsqueeze(0).expand_as(c)
-            c        = torch.where(fill_4d, nb_color, c)
+            # Normalize by valid neighbour count
+            safe_weight = nb_weight.clamp(min=1e-8)
+            nb_color = nb_color / safe_weight
 
-            # Newly-filled pixels become valid for the next iteration
+            # ── 5. Confidence blend ──────────────────────────────────────
+            # Only fill steep pixels that have at least one valid neighbour
+            has_valid_nb = nb_weight.squeeze() > (1.0 / 9.0 - 1e-6)  # at least ~1 valid
+            fillable = steep & has_valid_nb  # (H,W)
+
+            # Confidence: how many valid neighbours we had (0→1)
+            # More valid neighbours → higher confidence in the fill
+            confidence = nb_weight.squeeze().clamp(0.0, 1.0)  # (H,W)
+            confidence_4d = confidence.unsqueeze(0).unsqueeze(0).expand_as(c)
+            fill_4d = fillable.unsqueeze(0).unsqueeze(0).expand_as(c)
+
+            # Blend: filled_color * confidence + original * (1 - confidence)
+            blended = nb_color * confidence_4d + c * (1.0 - confidence_4d)
+            c = torch.where(fill_4d, blended, c)
+
+            # ── 6. Update valid mask ─────────────────────────────────────
+            # Newly-filled pixels become valid for next iteration
             valid = (valid + fillable.float()).clamp(0.0, 1.0)
             steep = steep & ~fillable
 
@@ -1232,6 +1319,11 @@ class CudaDepthFlowRenderer:
         output_format: str = "mp4",
         progress_cb: Optional[Callable[[int, int], None]] = None,
         capture_frames: int = 0,
+        enable_inpaint: bool = True,
+        inpaint_threshold: float = 0.04,
+        inpaint_iterations: int = 6,
+        inpaint_depth_aware: bool = True,
+        enable_aa: bool = True,
     ) -> str:
         """Render a full parallax video to *output_path*.
 
@@ -1279,6 +1371,9 @@ class CudaDepthFlowRenderer:
         print(f"[DepthFlow CUDA] Rendering {total_frames} frames "
               f"@ {ssaa_w}×{ssaa_h} (SSAA {ssaa}x) → {render_w}×{render_h}")
         print(f"[DepthFlow CUDA] Codec: {vcodec}, Output: {output_path}")
+        print(f"[DepthFlow CUDA] inpaint={enable_inpaint}, aa={enable_aa}, "
+              f"threshold={inpaint_threshold}, iterations={inpaint_iterations}, "
+              f"depth_aware={inpaint_depth_aware}")
 
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         t0 = time.perf_counter()
@@ -1297,7 +1392,14 @@ class CudaDepthFlowRenderer:
                     reverse=reverse, phase=phase,
                     steady_depth=steady_depth, isometric=isometric_val,
                 )
-                frame = self.render_frame(ssaa_w, ssaa_h, state, quality_pct)
+                frame = self.render_frame(
+                    ssaa_w, ssaa_h, state, quality_pct,
+                    enable_inpaint=enable_inpaint,
+                    inpaint_threshold=inpaint_threshold,
+                    inpaint_iterations=inpaint_iterations,
+                    inpaint_depth_aware=inpaint_depth_aware,
+                    enable_aa=enable_aa,
+                )
                 proc.stdin.write(frame.numpy().tobytes())
 
                 # Capture frame directly (already CPU uint8 HWC)
