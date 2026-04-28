@@ -611,7 +611,8 @@ class CudaDepthFlowRenderer:
         image: Any,
         depth: Any,
         device: str = "cuda",
-        depth_post_process: bool = True,
+        depth_post_process: bool = False,
+        depth_smooth_sigma: float = 0.0,
     ) -> None:
         if not _check_cuda():
             raise RuntimeError("CUDA not available — cannot use CudaDepthFlowRenderer")
@@ -624,25 +625,40 @@ class CudaDepthFlowRenderer:
             dep = dep[..., 0]
 
         self.img_h, self.img_w = img.shape[0], img.shape[1]
+        # Track depth map resolution separately (may differ from image)
+        self.dep_h, self.dep_w = dep.shape[0], dep.shape[1]
         # (1, 3, H, W) and (1, 1, H, W)
         self.image_gpu = img.permute(2, 0, 1).unsqueeze(0).to(self.device).contiguous()
         self.depth_gpu = dep.unsqueeze(0).unsqueeze(0).to(self.device).contiguous()
 
-        # Match DepthFlow DA2 depth post-processing:
-        # 1) Gaussian blur σ=0.6 — smooth high-frequency noise
-        # 2) 5×5 max-pool (dilation) — thicken foreground edges to prevent
-        #    background pixels from "peeking through" at silhouette boundaries
+        # Optional depth smoothing.
+        # NOTE: The GLSL path (depthflow.glsl) does NO depth post-processing.
+        # The previous MaxPool2d dilation caused foreground edge bloating,
+        # which was the root cause of stretching/fuzzy-edge artifacts.
         if depth_post_process:
-            self.depth_gpu = self._post_process_depth(self.depth_gpu)
+            self.depth_gpu = self._post_process_depth(
+                self.depth_gpu, sigma=depth_smooth_sigma,
+            )
 
     # ------------------------------------------------------------------ helpers
 
     @staticmethod
-    def _post_process_depth(depth_gpu: "torch.Tensor") -> "torch.Tensor":
-        """Match DepthFlow DA2 _post(): Gaussian(σ=0.6) + MaxPool(5)."""
-        # Gaussian blur kernel (7×7, σ=0.6)
-        sigma = 0.6
-        ks = 7  # kernel size (must be odd)
+    def _post_process_depth(
+        depth_gpu: "torch.Tensor",
+        sigma: float = 0.0,
+    ) -> "torch.Tensor":
+        """Optional light Gaussian smooth on depth map.
+
+        Unlike the previous version, this does **not** apply MaxPool2d
+        dilation. MaxPool was inflating foreground depth into background
+        regions, causing the ray-march to find false surface intersections
+        at silhouette boundaries → stretching / fuzzy edges.
+
+        The GLSL reference path applies NO depth post-processing at all.
+        """
+        if sigma <= 0:
+            return depth_gpu
+        ks = max(3, int(sigma * 6) | 1)  # odd kernel, covers ±3σ
         half = ks // 2
         coords = torch.arange(ks, dtype=torch.float32, device=depth_gpu.device) - half
         g1d = torch.exp(-0.5 * (coords / sigma) ** 2)
@@ -653,9 +669,7 @@ class CudaDepthFlowRenderer:
             F.pad(depth_gpu, (half, half, half, half), mode="replicate"),
             kernel,
         )
-        # 5×5 max-pool (foreground edge dilation, stride=1)
-        dilated = F.max_pool2d(blurred, kernel_size=5, stride=1, padding=2)
-        return dilated
+        return blurred
 
     def _to_tensor(self, x: Any) -> torch.Tensor:
         if isinstance(x, torch.Tensor):
@@ -677,15 +691,25 @@ class CudaDepthFlowRenderer:
     def _gluv_to_grid(
         self, gluv_x: torch.Tensor, gluv_y: torch.Tensor,
         mirror: bool, want_aspect: float,
+        tex_h: int = 0, tex_w: int = 0,
     ) -> torch.Tensor:
-        """Convert scene-gluv → ``grid_sample`` grid  (N=1, H, W, 2)."""
+        """Convert scene-gluv → ``grid_sample`` grid  (N=1, H, W, 2).
+
+        Matches GLSL ``gtexture``:
+            scale = vec2(textureSize(tex).y / textureSize(tex).x, 1)
+            stuv  = gluv2stuv(gluv * scale)
+            grid_sample coord = 2*stuv - 1 = gluv * scale
+
+        Parameters *tex_h* / *tex_w* allow using a **different** texture's
+        resolution (e.g. depth map) instead of the default image resolution.
+        """
         if mirror:
             gluv_x = want_aspect * _triangle_wave_t(gluv_x, 4.0 * want_aspect)
             gluv_y = _triangle_wave_t(gluv_y, 4.0)
 
-        # gtexture: scale = (tex_h/tex_w, 1); stuv = (gluv*scale +1)/2
-        # grid_sample coord = 2*stuv - 1 = gluv * scale
-        scale_x = float(self.img_h) / float(self.img_w)
+        th = tex_h if tex_h > 0 else self.img_h
+        tw = tex_w if tex_w > 0 else self.img_w
+        scale_x = float(th) / float(tw)
         grid_x = gluv_x * scale_x   # horizontal
         grid_y = -gluv_y             # flip Y (OpenGL → PyTorch)
         # stack → (H, W, 2), add batch
@@ -712,13 +736,14 @@ class CudaDepthFlowRenderer:
         dev = self.device
         probe_step = 1.0 / (50.0 + 70.0 * quality_norm)
         safe = 1.0 - df_height
-        scale_x = float(self.img_h) / float(self.img_w)
+        # Use depth map resolution for depth sampling (matches GLSL textureSize)
+        scale_x = float(self.dep_h) / float(self.dep_w)
         orig_z_val = float(orig_z.view(-1)[0].item())
 
         # ── Native CUDA kernel path (fastest) ──────────────────────────
         native = _get_native_module()
         if native is not None:
-            depth_flat = self.depth_gpu.view(self.img_h, self.img_w).contiguous()
+            depth_flat = self.depth_gpu.view(self.dep_h, self.dep_w).contiguous()
             ox = orig_x.contiguous()
             oy = orig_y.contiguous()
             ix = int_x.contiguous()
@@ -727,7 +752,7 @@ class CudaDepthFlowRenderer:
             walk, hit = native.native_forward_march(
                 depth_flat, ox, oy, ix, iy,
                 orig_z_val, render_w, render_h,
-                self.img_w, self.img_h,
+                self.dep_w, self.dep_h,
                 df_height, df_invert, mirror, want_aspect,
                 probe_step, safe, scale_x,
             )
@@ -737,7 +762,7 @@ class CudaDepthFlowRenderer:
             wout_list = native.native_bisect(
                 depth_flat, ox, oy, ix, iy,
                 walk, hit,
-                orig_z_val, self.img_w, self.img_h,
+                orig_z_val, self.dep_w, self.dep_h,
                 df_height, df_invert, mirror, want_aspect,
                 safe, scale_x, quality_step,
             )
@@ -756,6 +781,7 @@ class CudaDepthFlowRenderer:
             # Depth at result for post-processing → (1, 1, H, W)
             grid_final = self._gluv_to_grid(
                 result_gluv_x, result_gluv_y, mirror, want_aspect,
+                tex_h=self.dep_h, tex_w=self.dep_w,
             )
             value = F.grid_sample(
                 self.depth_gpu, grid_final, mode="bilinear",
@@ -1308,11 +1334,14 @@ class CudaDepthFlowRenderer:
                     reverse=reverse, phase=phase,
                     steady_depth=steady_depth, isometric=isometric_val,
                 )
+                # When SSAA > 1 the ffmpeg lanczos downscale already provides
+                # antialiasing.  Disable the tent-filter AA to avoid softness.
+                effective_aa = enable_aa and (ssaa <= 1.0)
                 frame = self.render_frame(
                     ssaa_w, ssaa_h, state, quality_pct,
                     enable_inpaint=enable_inpaint,
                     inpaint_threshold=inpaint_threshold,
-                    enable_aa=enable_aa,
+                    enable_aa=effective_aa,
                 )
                 proc.stdin.write(frame.numpy().tobytes())
 
