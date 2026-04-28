@@ -889,9 +889,8 @@ class CudaDepthFlowRenderer:
         state: DepthFlowState,
         quality_pct: float = 50.0,
         enable_inpaint: bool = True,
-        inpaint_threshold: float = 0.04,
-        inpaint_iterations: int = 6,
-        inpaint_depth_aware: bool = True,
+        inpaint_threshold: float = 0.5,
+        inpaint_blur: int = 5,
         enable_aa: bool = True,
     ) -> torch.Tensor:
         """Render one frame.  Returns (H, W, 3) uint8 tensor on CPU."""
@@ -988,28 +987,46 @@ class CudaDepthFlowRenderer:
             quality_norm, render_h, render_w,
         )
 
-        # --- Sample image at result gluv ---------------------------------
+        # --- Sample image at result gluv (ray-marched, with depth) --------
         img_grid = self._gluv_to_grid(result_gluv_x, result_gluv_y,
                                        mirror, want_aspect)
         color = F.grid_sample(self.image_gpu, img_grid, mode="bilinear",
                               padding_mode="border", align_corners=False)
         # color: (1, 3, H, W)
 
+        # --- Flat projection color (NO depth, original image) -------------
+        # This is the image sampled at the camera-projected UV without any
+        # depth displacement — matches GLSL's base `gtexture(image, gluv)`
+        flat_grid = self._gluv_to_grid(cam_gluv_x, cam_gluv_y,
+                                        mirror, want_aspect)
+        flat_color = F.grid_sample(self.image_gpu, flat_grid, mode="bilinear",
+                                    padding_mode="border", align_corners=False)
+
+        # --- Disocclusion repair: steep detection + flat fallback ----------
+        if enable_inpaint:
+            steep_mask = self._compute_steep_mask(
+                result_gluv_x, result_gluv_y, value,
+                quality_norm, df_height, threshold=inpaint_threshold,
+            )  # (H, W) float [0, 1]
+
+            if steep_mask.any():
+                # Soft-blend: smooth the binary mask for gradual transition
+                sm = steep_mask.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+                if inpaint_blur > 0:
+                    ks = inpaint_blur * 2 + 1  # ensure odd
+                    sm = F.avg_pool2d(
+                        F.pad(sm, (inpaint_blur, inpaint_blur,
+                                   inpaint_blur, inpaint_blur),
+                              mode="replicate"),
+                        kernel_size=ks, stride=1,
+                    )
+                sm = sm.clamp(0.0, 1.0)  # (1,1,H,W)
+                # Blend: steep → flat_color,  non-steep → ray-marched color
+                color = color * (1.0 - sm) + flat_color * sm
+
         # Apply OOB mask
         oob_mask = oob.unsqueeze(0).unsqueeze(0)
         color = torch.where(oob_mask, torch.zeros_like(color), color)
-
-        # --- Disocclusion inpaint (before post-processing / AA) -----------
-        if enable_inpaint and self._should_inpaint(state):
-            color = self._inpaint_disocclusions(
-                color=color,
-                result_gluv_x=result_gluv_x,
-                result_gluv_y=result_gluv_y,
-                depth_value=value,
-                threshold=inpaint_threshold,
-                iterations=inpaint_iterations,
-                depth_aware=inpaint_depth_aware,
-            )
 
 
         # --- Post-processing (matching GLSL) ------------------------------
@@ -1153,155 +1170,74 @@ class CudaDepthFlowRenderer:
         frame = frame.permute(1, 2, 0).contiguous()      # (H, W, 3)
         return frame.cpu()
 
-    # -------------------------------------------------------- inpainting
-
-    @staticmethod
-    def _should_inpaint(state: "DepthFlowState") -> bool:
-        """Return True if the current state has any camera movement that
-        would produce disocclusion artifacts worth inpainting."""
-        return (
-            abs(state.offset_x) > 1e-5 or
-            abs(state.offset_y) > 1e-5 or
-            abs(state.height - 0.2) > 1e-5 or
-            abs(state.isometric) > 1e-5 or
-            abs(state.dolly) > 1e-5 or
-            abs(state.zoom - 1.0) > 1e-5
-        )
+    # ------------------------------------------------------ steep detection
 
     @staticmethod
     @torch.inference_mode()
-    def _inpaint_disocclusions(
-        color: "torch.Tensor",             # (1, 3, H, W) float [0,1]
-        result_gluv_x: "torch.Tensor",     # (H, W)
-        result_gluv_y: "torch.Tensor",     # (H, W)
-        depth_value: Optional["torch.Tensor"] = None,  # (1, 1, H, W) float
-        threshold: float = 0.04,
-        iterations: int = 6,
-        depth_aware: bool = True,
+    def _compute_steep_mask(
+        result_gluv_x: "torch.Tensor",  # (H, W)
+        result_gluv_y: "torch.Tensor",  # (H, W)
+        depth_value: "torch.Tensor",    # (1, 1, H, W)
+        quality_norm: float,
+        df_height: float,
+        threshold: float = 0.5,
     ) -> "torch.Tensor":
         """
-        Fill disocclusion 'holes' at foreground silhouette edges.
+        Compute a steepness mask matching the GLSL DepthFlow reference.
 
-        When the camera moves, previously-occluded background regions become
-        visible near the foreground edge.  The ray-march has no colour source
-        for those pixels and replicates neighbours, producing stretched /
-        smeared edges.
+        GLSL computes:
+          derivative = (last_value - value) / quality_step
+          normal = normalize(vec3(dDepth/dx, dDepth/dy, max(height, step)))
+          steep = derivative * angle(normal, vec3(0,0,1))
 
-        Algorithm:
-        1. UV gradient mask — detect pixels where the UV coordinate gradient
-           is abnormally large (disocclusion boundaries).
-        2. Depth-aware mask — combine with depth edge detection to reduce
-           false positives on textured flat surfaces.
-        3. Mask dilation — expand the mask slightly to catch fringe pixels.
-        4. Iterative fill — weighted-average from valid (non-disoccluded)
-           neighbours via 3×3 conv2d, with confidence blending.
-        5. Foreground protection — holes don't contribute to the average;
-           only valid neighbours participate.
+        We replicate this with finite differences on the ray-marched UV
+        and depth map, producing a [0,1] float mask where 1 = fully steep
+        (disocclusion / stretching artifact).
+
+        Returns (H, W) float mask [0, 1].
         """
-        dev = color.device
+        dev = result_gluv_x.device
+        quality_step = 1.0 / (200.0 + 1800.0 * quality_norm)
 
-        # ── 1. UV gradient mask ──────────────────────────────────────────
-        # Forward finite differences
-        dx = F.pad(
+        # ── UV-space derivative (proxy for GLSL's depth derivative) ──────
+        # Forward differences on the result UV coordinates
+        dx_u = F.pad(
             (result_gluv_x[:, 1:] - result_gluv_x[:, :-1]).unsqueeze(0).unsqueeze(0),
-            (0, 1, 0, 0),
-        ).squeeze()
-        dy = F.pad(
+            (0, 1, 0, 0), mode="replicate",
+        ).squeeze()  # (H, W)
+        dy_v = F.pad(
             (result_gluv_y[1:, :] - result_gluv_y[:-1, :]).unsqueeze(0).unsqueeze(0),
-            (0, 0, 0, 1),
-        ).squeeze()
-        uv_grad = dx.abs() + dy.abs()  # (H, W)
-        steep = uv_grad > threshold    # (H, W) bool
+            (0, 0, 0, 1), mode="replicate",
+        ).squeeze()  # (H, W)
 
-        # ── 2. Depth-aware mask ──────────────────────────────────────────
-        if depth_aware and depth_value is not None:
-            dv = depth_value.squeeze()  # (H, W)
-            # Depth gradient
-            d_dx = F.pad(
-                (dv[:, 1:] - dv[:, :-1]).unsqueeze(0).unsqueeze(0),
-                (0, 1, 0, 0),
-            ).squeeze()
-            d_dy = F.pad(
-                (dv[1:, :] - dv[:-1, :]).unsqueeze(0).unsqueeze(0),
-                (0, 0, 0, 1),
-            ).squeeze()
-            depth_grad = d_dx.abs() + d_dy.abs()  # (H, W)
-            # Depth edge: where gradient is significantly above average
-            depth_mean = depth_grad.mean()
-            depth_std = depth_grad.std()
-            # Aggressive detection: Union of UV tears and Depth edges
-            # Also catch pixels where depth is significantly stretched
-            steep = steep | depth_edge
+        # UV gradient magnitude — large where ray-march UV jumps (disocclusion)
+        uv_deriv = (dx_u.abs() + dy_v.abs()) / max(quality_step, 1e-6)
 
+        # ── Surface normal from depth map ────────────────────────────────
+        dv = depth_value.squeeze()  # (H, W)
+        d_dx = F.pad(
+            (dv[:, 1:] - dv[:, :-1]).unsqueeze(0).unsqueeze(0),
+            (0, 1, 0, 0), mode="replicate",
+        ).squeeze() / max(quality_step, 1e-6)
+        d_dy = F.pad(
+            (dv[1:, :] - dv[:-1, :]).unsqueeze(0).unsqueeze(0),
+            (0, 0, 0, 1), mode="replicate",
+        ).squeeze() / max(quality_step, 1e-6)
 
-        if not steep.any():
-            return color
+        nz = max(df_height, quality_step)
+        normal_len = (d_dx ** 2 + d_dy ** 2 + nz ** 2).sqrt()
+        cos_angle = nz / normal_len.clamp(min=1e-8)  # cos(angle to z-axis)
+        # angle = acos(cos) — but we only need a monotonic proxy:
+        # angle ∈ [0, π/2], sin(angle) = sqrt(1 - cos²) is simpler
+        sin_angle = (1.0 - cos_angle ** 2).clamp(min=0.0).sqrt()
 
-        # ── 3. Mask dilation ─────────────────────────────────────────────
-        # Dilate aggressively based on iteration count to swallow long streaks
-        dial_radius = max(2, iterations // 3)
-        steep_float = steep.float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-        steep = F.max_pool2d(steep_float, kernel_size=dial_radius*2+1, stride=1, padding=dial_radius)
-        steep = steep.squeeze() > 0.5  # back to (H, W) bool
+        # ── Steepness = derivative × angle (matching GLSL) ───────────────
+        steep_raw = uv_deriv * sin_angle  # (H, W)
 
+        # Normalize to [0, 1] with soft threshold
+        steep_mask = (steep_raw / max(threshold, 1e-6)).clamp(0.0, 1.0)
 
-        # ── 4. Iterative fill ────────────────────────────────────────────
-        # 3×3 uniform kernel (shared across channels via groups)
-        fill_k = torch.ones(1, 1, 3, 3, dtype=color.dtype, device=dev) / 9.0
-        valid = (~steep).float()  # (H, W): 1=valid, 0=hole
-        c = color.clone()         # (1, 3, H, W)
-
-        for _ in range(iterations):
-            if not steep.any():
-                break
-
-            valid_4d = valid.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-
-            # Background-prioritized fill:
-            # We want to sample background colors for sky holes, not hair colors.
-            # Use depth_value to weight neighbors: deeper pixels (lower values) get more weight.
-            if depth_aware and depth_value is not None:
-                dv_4d = depth_value.detach()
-                # Weight = e^(-5*depth) * valid_mask. In DepthFlow, 0=bg, 1=fg.
-                # So we want low depth values to have high weight.
-                d_weight = torch.exp(-5.0 * dv_4d) * valid_4d
-                nb_weight = F.conv2d(F.pad(d_weight, (1, 1, 1, 1), mode="constant", value=0), fill_k)
-                nb_color = F.conv2d(
-                    F.pad(c * d_weight, (1, 1, 1, 1), mode="constant", value=0),
-                    fill_k.expand(3, 1, 3, 3), groups=3
-                )
-            else:
-                nb_weight = F.conv2d(F.pad(valid_4d, (1, 1, 1, 1), mode="constant", value=0), fill_k)
-                nb_color = F.conv2d(
-                    F.pad(c * valid_4d, (1, 1, 1, 1), mode="constant", value=0),
-                    fill_k.expand(3, 1, 3, 3), groups=3
-                )
-
-            # Normalize by weights
-            safe_weight = nb_weight.clamp(min=1e-8)
-            nb_color = nb_color / safe_weight
-
-            # ── 5. Confidence blend ──────────────────────────────────────
-            # Only fill steep pixels that have at least one valid neighbour
-            has_valid_nb = nb_weight.squeeze() > (1.0 / 9.0 - 1e-6)  # at least ~1 valid
-            fillable = steep & has_valid_nb  # (H,W)
-
-            # Confidence: how many valid neighbours we had (0→1)
-            # More valid neighbours → higher confidence in the fill
-            confidence = nb_weight.squeeze().clamp(0.0, 1.0)  # (H,W)
-            confidence_4d = confidence.unsqueeze(0).unsqueeze(0).expand_as(c)
-            fill_4d = fillable.unsqueeze(0).unsqueeze(0).expand_as(c)
-
-            # Blend: filled_color * confidence + original * (1 - confidence)
-            blended = nb_color * confidence_4d + c * (1.0 - confidence_4d)
-            c = torch.where(fill_4d, blended, c)
-
-            # ── 6. Update valid mask ─────────────────────────────────────
-            # Newly-filled pixels become valid for next iteration
-            valid = (valid + fillable.float()).clamp(0.0, 1.0)
-            steep = steep & ~fillable
-
-        return c
+        return steep_mask
 
     # ------------------------------------------------------------------ video
 
@@ -1327,9 +1263,8 @@ class CudaDepthFlowRenderer:
         progress_cb: Optional[Callable[[int, int], None]] = None,
         capture_frames: int = 0,
         enable_inpaint: bool = True,
-        inpaint_threshold: float = 0.04,
-        inpaint_iterations: int = 6,
-        inpaint_depth_aware: bool = True,
+        inpaint_threshold: float = 0.5,
+        inpaint_blur: int = 5,
         enable_aa: bool = True,
     ) -> str:
         """Render a full parallax video to *output_path*.
@@ -1378,9 +1313,6 @@ class CudaDepthFlowRenderer:
         print(f"[DepthFlow CUDA] Rendering {total_frames} frames "
               f"@ {ssaa_w}×{ssaa_h} (SSAA {ssaa}x) → {render_w}×{render_h}")
         print(f"[DepthFlow CUDA] Codec: {vcodec}, Output: {output_path}")
-        print(f"[DepthFlow CUDA] inpaint={enable_inpaint}, aa={enable_aa}, "
-              f"threshold={inpaint_threshold}, iterations={inpaint_iterations}, "
-              f"depth_aware={inpaint_depth_aware}")
 
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         t0 = time.perf_counter()
@@ -1403,8 +1335,7 @@ class CudaDepthFlowRenderer:
                     ssaa_w, ssaa_h, state, quality_pct,
                     enable_inpaint=enable_inpaint,
                     inpaint_threshold=inpaint_threshold,
-                    inpaint_iterations=inpaint_iterations,
-                    inpaint_depth_aware=inpaint_depth_aware,
+                    inpaint_blur=inpaint_blur,
                     enable_aa=enable_aa,
                 )
                 proc.stdin.write(frame.numpy().tobytes())
