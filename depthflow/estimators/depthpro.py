@@ -12,6 +12,7 @@ from PIL import Image
 from pydantic import PrivateAttr
 from shaderflow.resolution import Resolution
 
+import depthflow
 from depthflow.estimators import DepthEstimator
 
 logger = logging.getLogger(__name__)
@@ -32,14 +33,13 @@ class DepthPro(DepthEstimator):
 
         # Download external checkpoint model
         logger.info("Loading Depth Estimator model (DepthPro)")
-        import depthflow
-        checkpoint = pooch.retrieve(
+        checkpoint = Path(pooch.retrieve(
             url="https://ml-site.cdn-apple.com/models/depth-pro/depth_pro.pt",
-            known_hash=None,
+            known_hash="xxh128:d66f5787be967c80c160f1a1f293dc76",
             path=depthflow.directories.user_data_path,
             fname="depth_pro.pt",
             progressbar=True,
-        )
+        ))
 
         import torch
         from depth_pro import create_model_and_transforms
