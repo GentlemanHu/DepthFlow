@@ -1,2 +1,15 @@
 .cache
 site
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/

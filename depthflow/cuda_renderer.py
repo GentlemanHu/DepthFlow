@@ -916,6 +916,7 @@ class CudaDepthFlowRenderer:
         quality_pct: float = 50.0,
         enable_inpaint: bool = False,
         inpaint_threshold: float = 3.0,
+        inpaint_mode: str = "off",
         enable_aa: bool = True,
     ) -> torch.Tensor:
         """Render one frame.  Returns (H, W, 3) uint8 tensor on CPU."""
@@ -1019,11 +1020,11 @@ class CudaDepthFlowRenderer:
                               padding_mode="border", align_corners=False)
         # color: (1, 3, H, W)
 
-        # --- Edge soften: blur only at depth-discontinuity edges ----------
-        # Detects pixels where the ray-marched UV jumps abnormally (stretched
-        # edges at foreground silhouettes) and applies a targeted Gaussian
-        # blur only at those pixels. No perspective mixing = no ghosting.
-        if enable_inpaint:
+        # --- Optional non-GLSL edge soften -------------------------------
+        # DepthFlow GLSL's iInpaint path is a diagnostic green mask, not a
+        # beauty inpaint.  Keep softening opt-in so the default CUDA output can
+        # stay aligned with the OpenGL/GLSL reference path.
+        if enable_inpaint and inpaint_mode == "soften":
             color = self._edge_soften(
                 color, result_gluv_x, result_gluv_y,
                 render_w, render_h, want_aspect,
@@ -1087,7 +1088,10 @@ class CudaDepthFlowRenderer:
             smoothstep_val = _smoothstep_t(
                 state.blur_start, state.blur_end, 1.0 - depth_val,
             )
-            intensity_map = state.blur_intensity * smoothstep_val.pow(state.blur_exponent)
+            # GLSL receives iBlurIntensity from BlurState.pipeline() as
+            # intensity / 100.  The CUDA path stores the UI/state value, so it
+            # must apply the same conversion here to match OpenGL/GLSL DOF.
+            intensity_map = (state.blur_intensity / 100.0) * smoothstep_val.pow(state.blur_exponent)
             acc_color = color.clone()
             n_blur_samples = state.blur_directions * state.blur_quality
             tau_val = 2.0 * math.pi
@@ -1341,6 +1345,7 @@ class CudaDepthFlowRenderer:
                     ssaa_w, ssaa_h, state, quality_pct,
                     enable_inpaint=enable_inpaint,
                     inpaint_threshold=inpaint_threshold,
+                    inpaint_mode="soften" if enable_inpaint else "off",
                     enable_aa=effective_aa,
                 )
                 proc.stdin.write(frame.numpy().tobytes())
