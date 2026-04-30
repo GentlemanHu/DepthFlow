@@ -425,9 +425,9 @@ def compute_animation_state(
         state.steady = steady_depth
         if loop:
             state.offset_y = (_compute_sine if smooth else _compute_triangle)(
-                tau, cycle, 0.8 * intensity, phase, cycles=1.0,
+                tau, cycle, intensity, phase, cycles=1.0,
             ) if smooth else _compute_triangle(
-                tau, 0.8 * intensity, phase, cycles=1.0,
+                tau, intensity, phase, cycles=1.0,
             )
         else:
             state.offset_y = (_compute_sine if smooth else _compute_triangle)(
@@ -441,9 +441,9 @@ def compute_animation_state(
         state.steady = steady_depth
         if loop:
             state.offset_x = (_compute_sine if smooth else _compute_triangle)(
-                tau, cycle, 0.8 * intensity, phase, cycles=1.0,
+                tau, cycle, intensity, phase, cycles=1.0,
             ) if smooth else _compute_triangle(
-                tau, 0.8 * intensity, phase, cycles=1.0,
+                tau, intensity, phase, cycles=1.0,
             )
         else:
             state.offset_x = (_compute_sine if smooth else _compute_triangle)(
@@ -471,10 +471,10 @@ def compute_animation_state(
         state.isometric = isometric
         state.steady = steady_depth
         state.offset_x = _compute_sine(
-            tau, cycle, 0.5 * intensity, phase + 0.25,
+            tau, cycle, 0.5 * intensity, phase,
         )
         state.offset_y = _compute_sine(
-            tau, cycle, 0.5 * intensity, phase,
+            tau, cycle, 0.5 * intensity, phase + 0.25,
         )
 
     elif move == "dolly":
@@ -876,9 +876,13 @@ class CudaDepthFlowRenderer:
             surface = df_height * (
                 d_val * (1.0 - df_invert) + (1.0 - d_val) * df_invert
             )
-            # GLSL: ceiling >= surface → outside → stop
-            still_inside = refining & (surface > ceiling)
-            walk_result = torch.where(still_inside, walk_cand, walk_result)
+            # GLSL updates depth.gluv to the current backward candidate before
+            # deciding whether it is outside.  Keep that candidate for both
+            # "still inside" and "first outside" pixels; otherwise the fallback
+            # stops one quality step too deep and stretches silhouettes.
+            active = refining
+            still_inside = active & (surface > ceiling)
+            walk_result = torch.where(active, walk_cand, walk_result)
             refining = still_inside
 
             if not refining.any():
@@ -940,7 +944,9 @@ class CudaDepthFlowRenderer:
         df_zoom = state.zoom
         df_iso = state.isometric
         df_dolly = state.dolly
-        df_invert = state.invert
+        # DepthFlow's reference GLSL has no depth-invert state; keep the
+        # ray-march surface calculation on the raw depth value for OpenGL parity.
+        df_invert = 0.0
         offset_x = state.offset_x
         offset_y = state.offset_y
         center_x = state.center_x
