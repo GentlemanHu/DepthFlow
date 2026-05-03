@@ -944,8 +944,8 @@ class CudaDepthFlowRenderer:
         df_zoom = state.zoom
         df_iso = state.isometric
         df_dolly = state.dolly
-        # DepthFlow's reference GLSL has no depth-invert state; keep the
-        # ray-march surface calculation on the raw depth value for OpenGL parity.
+        # Keep CUDA aligned with the reference GLSL path. Depth inversion is
+        # handled as input depth-map preparation, not as a DepthState uniform.
         df_invert = 0.0
         offset_x = state.offset_x
         offset_y = state.offset_y
