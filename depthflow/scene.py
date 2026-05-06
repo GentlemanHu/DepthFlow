@@ -51,7 +51,12 @@ class DepthScene(ShaderScene):
             self.cli.command(DepthAnythingV3, name="da3", group=group, result_action=self.smartset)
 
         with contextlib.nullcontext("Animation") as group:
-            for cls in Action.__subclasses__():
+            try:
+                from depthflow.vhs_animation import VHS_ANIMATION_CLASSES
+                animation_classes = VHS_ANIMATION_CLASSES
+            except Exception:
+                animation_classes = Action.__subclasses__()
+            for cls in animation_classes:
                 self.cli.command(cls, group=group, result_action=self.animation.steps.append)
 
     def input(self,
