@@ -101,7 +101,8 @@ class DepthScene(ShaderScene):
         self.image.from_numpy(self._raw_image)
         self.depth.from_numpy(self._raw_depth)
         # Match rendering resolution to image
-        self.resolution = self.image.size
+        width, height = self.image.size
+        self.resize(width=width, height=height)
 
     # ------------------------------------------------------------------------ #
     # CUDA backend — bypass OpenGL entirely
